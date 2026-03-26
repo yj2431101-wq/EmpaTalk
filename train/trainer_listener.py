@@ -110,6 +110,7 @@ class TrainerListener(nn.Module):
         self.lambda_vgg = getattr(args, "lambda_vgg", 1.0)
         self.lambda_l1  = getattr(args, "lambda_l1",  1.0)
         self.lambda_adv = getattr(args, "lambda_adv",  0.1)
+        self.lambda_bank = getattr(args, "lambda_adv",  1.0)
 
         self.start_iter = 0
 
@@ -206,13 +207,20 @@ class TrainerListener(nn.Module):
             mode=self.training_mode,
             training=True,
         )
+        # img_recon, f_pose, f_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e
 
+        '''GAN loss'''
         adv_pred = self.dis(img_recon)
+        adv_loss = F.softplus(-adv_pred).mean()
+        '''recon loss'''
         vgg_loss = self.criterion_vgg(img_recon, img_listener_tgt).mean()
         l1_loss  = F.l1_loss(img_recon, img_listener_tgt)
-        adv_loss = F.softplus(-adv_pred).mean()
+        '''bank loss'''
+        p_loss = 0
+        e_loss = 0
+        bank_loss = p_loss + e_loss
 
-        # KL loss — only computed in active mode (VAE is not used in passive)
+        '''KL loss''' # — only computed in active mode (VAE is not used in passive)
         kl_loss = torch.zeros(1, device=self.device)
         if mu_p is not None and kl_weight > 0.0:
             kl_loss = (
@@ -223,12 +231,13 @@ class TrainerListener(nn.Module):
             self.lambda_vgg * vgg_loss
             + self.lambda_l1  * l1_loss
             + self.lambda_adv * adv_loss
+            + self.lambda_bank * bank_loss
             + kl_loss
         )
         g_loss.backward()
         self.g_optim.step()
 
-        return vgg_loss, l1_loss, adv_loss, kl_loss, img_recon.detach()
+        return vgg_loss, l1_loss, adv_loss, kl_loss, bank_loss, g_loss, img_recon.detach()
 
     def dis_update(
         self,

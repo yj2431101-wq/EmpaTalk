@@ -316,6 +316,8 @@ class Generator(nn.Module):
 
         # 2. Listener identity appearance + spatial features
         wa_L, _, feats_L, _ = self.enc(img_listener, None, h_start)  # (B, 512)
+        # wa_L=h_source: final latent from conv
+        # feats: middle latents from conv
 
         # 3. Mode-dependent motion features
         mu_p = mu_e = logvar_p = logvar_e = None
@@ -330,12 +332,12 @@ class Generator(nn.Module):
             alpha_D_pose = self.pose_fc(self.fc(f_pose))
             alpha_D_exp  = self.exp_fc(self.fc(f_exp))
 
-        else:  # active
+        else:  # active # empathy 학습
             # Stage 3: stochastic pose/exp from VAE; lip driven by TTS audio.
             # Pass wa_L as VAE context: listener identity conditions the reaction,
             # speaker influence comes only through bank retrieval (latent_poseD_S).
             f_pose, f_exp, mu_p, logvar_p, mu_e, logvar_e = \
-                self.listener_bank.forward_active(latent_poseD_S, wa_S=wa_L, training=training)
+                self.listener_bank.forward_active(latent_poseD_S, wa_L=wa_L, training=training) # 여기서 cross attention
 
             # Use audio-derived lip features if provided, otherwise zero
             alpha_D_lip = (
@@ -348,8 +350,8 @@ class Generator(nn.Module):
 
         # 4. Direction mapping
         alpha_D_L = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
-        a_L = self.direction_exp.get_shared_out(alpha_D_L, self.direction_lipnonlip.weight)
-        e_L = self.direction_exp.get_exp_latent(a_L)
+        a_L = self.direction_exp.get_shared_out(alpha_D_L, self.direction_lipnonlip.weight) # orthogonal
+        e_L = self.direction_exp.get_exp_latent(a_L) # orthogonal
         directions_D_L = self.direction_exp(alpha_D_L, self.direction_lipnonlip.weight)
 
         # 5. Apply listener motion directions directly onto listener appearance.
@@ -362,4 +364,4 @@ class Generator(nn.Module):
         # 6. Decode
         img_recon = self.dec(latent_poseD_L, feats_L, e_L)
 
-        return img_recon, f_pose, f_exp, latent_poseD_S, mu_p, logvar_p, mu_e, logvar_e
+        return img_recon, f_pose, f_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e

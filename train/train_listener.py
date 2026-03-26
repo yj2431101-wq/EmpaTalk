@@ -169,7 +169,7 @@ def main(args):
                 kl_weight = 0.0
 
             # Generator step
-            vgg_loss, l1_loss, adv_loss, kl_loss, img_recon = trainer.gen_update(
+            vgg_loss, l1_loss, adv_loss, kl_loss, bank_loss, g_loss, img_recon = trainer.gen_update(
                 img_spk, img_src, img_tgt, kl_weight=kl_weight
             )
 
@@ -182,6 +182,8 @@ def main(args):
                 l1=f"{l1_loss.item():.3f}",
                 adv=f"{adv_loss.item():.3f}",
                 kl=f"{kl_loss.item():.3f}",
+                bank=f"{bank_loss.item():.3f}",
+                g=f"{g_loss.item():.3f}",
                 d=f"{d_loss.item():.3f}",
             )
 
@@ -194,6 +196,7 @@ def main(args):
                     f"[Epoch {epoch}/{args.epoch}] [Iter {current_iter}] "
                     f"vgg={vgg_loss.item():.4f}  l1={l1_loss.item():.4f}  "
                     f"adv={adv_loss.item():.4f}  kl={kl_loss.item():.4f}  "
+                    f"bank={bank_loss.item():.4f}  g={g_loss.item():.4f}  "
                     f"d={d_loss.item():.4f}"
                 )
 

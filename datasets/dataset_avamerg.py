@@ -65,7 +65,7 @@ def _find_video(video_dir: str, video_id: str) -> str:
     )
 
 
-def _read_frame(cap: cv2.VideoCapture, frame_idx: int, size: int) -> torch.Tensor:
+def _read_frame(cap: cv2.VideoCapture, frame_idx: int, size: int) -> torch.Tensor: # 전처리 미리하면 확 빨라질까?
     """Read a single frame from an open VideoCapture and return (C, H, W) in [-1, 1]."""
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, bgr = cap.read()

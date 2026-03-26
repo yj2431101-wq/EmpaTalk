@@ -132,8 +132,8 @@ class ListenerBank(nn.Module):
 
         # --- Three learnable prototype banks  (K, D) each ---
         self.lip_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim))
-        self.pose_bank = nn.Parameter(torch.randn(num_prototypes, feature_dim))
-        self.exp_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim))
+        self.pose_bank = nn.Parameter(torch.randn(num_prototypes, feature_dim)) # listener bank is random input #TO-DO
+        self.exp_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim)) # listener bank is random input #TO-DO
 
         # --- Per-bank cross-attention projections ---
         self.lip_q  = EqualLinear(feature_dim, feature_dim)
@@ -239,8 +239,8 @@ class ListenerBank(nn.Module):
             f_pose_final: (B, D) listener pose feature.
             f_exp_final:  (B, D) listener expression feature.
         """
-        f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)
-        f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S)
+        f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S) #cross attention
+        f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S) #cross attention
 
         # Normalise f_s to the same magnitude as f_l so α is a true mixing ratio.
         # Without this, the QR-basis scale of f_s may differ wildly from the
@@ -248,16 +248,16 @@ class ListenerBank(nn.Module):
         scale_p = f_pose_L.norm(dim=-1, keepdim=True) / (f_pose_S.norm(dim=-1, keepdim=True) + 1e-8)
         scale_e = f_exp_L.norm(dim=-1, keepdim=True)  / (f_exp_S.norm(dim=-1, keepdim=True)  + 1e-8)
 
-        f_pose_final = f_pose_L + self.mirror_alpha_p * scale_p * f_pose_S
-        f_exp_final  = f_exp_L  + self.mirror_alpha_e * scale_e * f_exp_S
+        f_pose_final = f_pose_L + self.mirror_alpha_p * scale_p * f_pose_S # 왜 speaker의 것을 더해주지?
+        f_exp_final  = f_exp_L  + self.mirror_alpha_e * scale_e * f_exp_S # 왜 speaker의 것을 더해주지?
 
         return f_pose_final, f_exp_final
 
     # ------------------------------------------------------------------
-    def forward_active(
+    def forward_active( # empathy 학습
         self,
         latent_poseD_S: torch.Tensor,
-        wa_S: torch.Tensor = None,
+        wa_L: torch.Tensor = None,
         training: bool = True,
     ):
         """Stage 3 — active empathic reaction with stochastic pose/expression.
@@ -269,7 +269,7 @@ class ListenerBank(nn.Module):
 
         Args:
             latent_poseD_S: (B, D) speaker pre-decoder latent (used for bank retrieval only).
-            wa_S:           (B, D) speaker appearance code without motion (used as VAE context).
+            wa_L:           (B, D) listener appearance code without motion (used as VAE context).
                             If None, falls back to latent_poseD_S (backward compat).
             training:       If True, use reparameterization sampling;
                             if False, use μ (deterministic mean).
@@ -284,13 +284,13 @@ class ListenerBank(nn.Module):
         """
         # Use motion-free speaker appearance as VAE context to prevent the VAE
         # from copying speaker head/expression motion onto the listener.
-        vae_ctx = wa_S if wa_S is not None else latent_poseD_S
+        vae_ctx = wa_L if wa_L is not None else latent_poseD_S
 
         # Query only pose and exp banks — lip bank is not used in active mode
         # (lip is driven by TTS audio externally).  Skipping lip_bank avoids
         # computing gradients for parameters that would never be updated.
-        f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)
-        f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S)
+        f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S) #cross attention
+        f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S) #cross attention
 
         f_pose, mu_p, logvar_p = self.pose_vae(
             vae_ctx, f_pose_L, deterministic=not training

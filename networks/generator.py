@@ -345,14 +345,14 @@ class Generator(nn.Module):
                 if audio_lip_feat is not None
                 else torch.zeros(B, self.lip_dim, device=device)
             )
-            alpha_D_pose = self.pose_fc(self.fc(f_pose))
-            alpha_D_exp  = self.exp_fc(self.fc(f_exp))
+            alpha_D_pose = self.pose_fc(self.fc(f_pose)) #(B, 6)
+            alpha_D_exp  = self.exp_fc(self.fc(f_exp)) #(B, 10)
 
         # 4. Direction mapping
         alpha_D_L = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
         a_L = self.direction_exp.get_shared_out(alpha_D_L, self.direction_lipnonlip.weight) # orthogonal
         e_L = self.direction_exp.get_exp_latent(a_L) # orthogonal
-        directions_D_L = self.direction_exp(alpha_D_L, self.direction_lipnonlip.weight)
+        directions_D_L = self.direction_exp(alpha_D_L, self.direction_lipnonlip.weight) #(B, 512)
 
         # 5. Apply listener motion directions directly onto listener appearance.
         # directions_D_L is in the pretrained W-space and directly encodes
@@ -364,4 +364,4 @@ class Generator(nn.Module):
         # 6. Decode
         img_recon = self.dec(latent_poseD_L, feats_L, e_L)
 
-        return img_recon, f_pose, f_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e
+        return img_recon, alpha_D_pose, alpha_D_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e

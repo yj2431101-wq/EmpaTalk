@@ -110,7 +110,7 @@ class TrainerListener(nn.Module):
         self.lambda_vgg = getattr(args, "lambda_vgg", 1.0)
         self.lambda_l1  = getattr(args, "lambda_l1",  1.0)
         self.lambda_adv = getattr(args, "lambda_adv",  0.1)
-        self.lambda_bank = getattr(args, "lambda_adv",  1.0)
+        self.lambda_bank = getattr(args, "lambda_adv",  5.0)
 
         self.start_iter = 0
 
@@ -202,12 +202,19 @@ class TrainerListener(nn.Module):
         _requires_grad(self._raw_gen.listener_bank, True)
         _requires_grad(self._raw_dis, False)
 
-        img_recon, _, _, _, mu_p, logvar_p, mu_e, logvar_e = self._raw_gen.forward_listener(
+        """1) generate listener"""
+        img_recon, alpha_D_pose, alpha_D_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e\
+            = self._raw_gen.forward_listener(
             img_speaker, img_listener_src,
             mode=self.training_mode,
             training=True,
         )
-        # img_recon, f_pose, f_exp, latent_poseD_L, mu_p, logvar_p, mu_e, logvar_e
+
+        """2) GT bank"""
+        with torch.no_grad():
+            _, _, f_pose_tgt, f_exp_tgt = self._raw_gen._speaker_latent(img_listener_tgt)
+            alpha_D_pose_tgt = self._raw_gen.pose_fc(self._raw_gen.fc(f_pose_tgt)) #(B, 6)
+            alpha_D_exp_tgt = self._raw_gen.exp_fc(self._raw_gen.fc(f_exp_tgt)) #(B, 10)
 
         '''GAN loss'''
         adv_pred = self.dis(img_recon)
@@ -216,10 +223,9 @@ class TrainerListener(nn.Module):
         vgg_loss = self.criterion_vgg(img_recon, img_listener_tgt).mean()
         l1_loss  = F.l1_loss(img_recon, img_listener_tgt)
         '''bank loss'''
-        p_loss = 0
-        e_loss = 0
+        p_loss = F.l1_loss(alpha_D_pose_gen, alpha_D_pose_tgt.detach())
+        e_loss = F.l1_loss(alpha_D_exp_gen, alpha_D_exp_tgt.detach())
         bank_loss = p_loss + e_loss
-
         '''KL loss''' # — only computed in active mode (VAE is not used in passive)
         kl_loss = torch.zeros(1, device=self.device)
         if mu_p is not None and kl_weight > 0.0:

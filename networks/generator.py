@@ -2,6 +2,7 @@ from torch import nn
 from .encoder import *
 from .styledecoder import Synthesis
 from .listener_bank import ListenerBank
+from .audio_encoder import Audio2Lip
 import torch
 
 class Direction(nn.Module):
@@ -116,6 +117,7 @@ class Generator(nn.Module):
     def __init__(self, size, style_dim=512, lip_dim=20, pose_dim=6, exp_dim=10,
                  channel_multiplier=1, blur_kernel=[1, 3, 3, 1],
                  num_listener_prototypes=32, vae_latent_dim=64,
+                 audio_dim=80, audio2lip_ckpt=None,
                  mirror_alpha_p=0.2, mirror_alpha_e=0.2):
         super(Generator, self).__init__()
 
@@ -154,9 +156,22 @@ class Generator(nn.Module):
         self.listener_bank = ListenerBank(
             num_listener_prototypes, style_dim,
             vae_latent_dim=vae_latent_dim,
+            audio_dim=audio_dim,
+            pose_dim=pose_dim,
+            exp_dim=exp_dim,
             mirror_alpha_p=mirror_alpha_p,
             mirror_alpha_e=mirror_alpha_e,
         )
+
+        # Audio2Lip: converts predicted mel (B, 80) → lip coefficients (B, lip_dim=20)
+        # Frozen after loading; not included in any optimizer.
+        self.audio2lip = Audio2Lip()
+        if audio2lip_ckpt is not None:
+            w = torch.load(audio2lip_ckpt, map_location="cpu", weights_only=False)
+            self.audio2lip.load_state_dict(w["audio2lip"])
+            print(f"Loaded Audio2Lip weights from {audio2lip_ckpt}")
+        for p in self.audio2lip.parameters():
+            p.requires_grad = False
 
 
     def test_EDTalk_V(self, img_source, lip_img_drive, pose_img_drive, exp_img_drive, h_start=None):
@@ -274,6 +289,7 @@ class Generator(nn.Module):
         h_start=None,
         mode: str = 'active',
         audio_lip_feat=None,
+        speaker_audio_mel=None,
         training: bool = True,
     ):
         """Generate an empathetic listener response conditioned on a speaker frame.
@@ -318,33 +334,33 @@ class Generator(nn.Module):
         wa_L, _, feats_L, _ = self.enc(img_listener, None, h_start)  # (B, 512)
 
         # 3. Mode-dependent motion features
-        mu_p = mu_e = logvar_p = logvar_e = None
+        mu_p = mu_e = mu_a = logvar_p = logvar_e = logvar_a = audio_mel = None
 
         if mode == 'passive':
             # Stage 1: silent mirroring — lip closed, pose/exp echo speaker softly
-            f_pose, f_exp = self.listener_bank.forward_passive(
+            # bank returns alpha coefficients directly via listener_pose/exp_fc
+            alpha_D_lip  = torch.zeros(B, self.lip_dim, device=device)
+            alpha_D_pose, alpha_D_exp = self.listener_bank.forward_passive(
                 latent_poseD_S, f_pose_S, f_exp_S
             )
-            # Lip coefficient = 0 → no mouth movement
-            alpha_D_lip  = torch.zeros(B, self.lip_dim, device=device)
-            alpha_D_pose = self.pose_fc(self.fc(f_pose))
-            alpha_D_exp  = self.exp_fc(self.fc(f_exp))
 
         else:  # active
-            # Stage 3: stochastic pose/exp from VAE; lip driven by TTS audio.
-            # Pass wa_L as VAE context: listener identity conditions the reaction,
-            # speaker influence comes only through bank retrieval (latent_poseD_S).
-            f_pose, f_exp, mu_p, logvar_p, mu_e, logvar_e = \
-                self.listener_bank.forward_active(latent_poseD_S, wa_S=wa_L, training=training)
+            # Stage 3: bank returns alpha coefficients directly;
+            # audio features contribute to expression/pose via audio_exp/pose_proj.
+            alpha_D_pose, alpha_D_exp, audio_mel, mu_p, logvar_p, mu_e, logvar_e, mu_a, logvar_a = \
+                self.listener_bank.forward_active(
+                    latent_poseD_S, wa_S=wa_L, training=training,
+                    speaker_audio_feat=speaker_audio_mel,
+                )
 
-            # Use audio-derived lip features if provided, otherwise zero
-            alpha_D_lip = (
-                audio_lip_feat
-                if audio_lip_feat is not None
-                else torch.zeros(B, self.lip_dim, device=device)
-            )
-            alpha_D_pose = self.pose_fc(self.fc(f_pose))
-            alpha_D_exp  = self.exp_fc(self.fc(f_exp))
+            if audio_lip_feat is not None:
+                alpha_D_lip = audio_lip_feat
+            elif audio_mel is not None:
+                mel_input = audio_mel.detach().unsqueeze(1).unsqueeze(-1).expand(B, 1, 80, 16).contiguous()
+                with torch.no_grad():
+                    alpha_D_lip = self.audio2lip(mel_input, B, 1).squeeze(1)  # (B, 20)
+            else:
+                alpha_D_lip = torch.zeros(B, self.lip_dim, device=device)
 
         # 4. Direction mapping
         alpha_D_L = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
@@ -362,4 +378,4 @@ class Generator(nn.Module):
         # 6. Decode
         img_recon = self.dec(latent_poseD_L, feats_L, e_L)
 
-        return img_recon, f_pose, f_exp, latent_poseD_S, mu_p, logvar_p, mu_e, logvar_e
+        return img_recon, f_pose, f_exp, latent_poseD_S, mu_p, logvar_p, mu_e, logvar_e, audio_mel, mu_a, logvar_a

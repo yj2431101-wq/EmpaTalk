@@ -27,11 +27,14 @@ Each __getitem__ returns a dict with keys:
     speaker_frame   – (C, H, W) float32 in [-1, 1]  speaker at time t
     listener_source – (C, H, W) float32 in [-1, 1]  listener identity frame (t - gap)
     listener_target – (C, H, W) float32 in [-1, 1]  ground-truth listener at time t
+    listener_mel    – (N_MELS,) float32              averaged mel at frame t, or zeros if audio missing
     pair_id         – str  "<speaker_id>#<listener_id>@<frame_idx>"
 """
 
+import glob
 import json
 import os
+import sys
 import random
 from typing import Optional
 
@@ -40,6 +43,34 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
+
+# Audio utilities (audio.py lives one level up)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import audio as _audio_utils
+
+# Mel parameters (must match hparams.py)
+_SR       = 16000   # sample rate
+_FPS      = 25      # video fps
+_HOP      = 200     # hop_size in samples
+_N_MELS   = 80      # num_mels
+_MEL_WIN  = 16      # mel time-frames averaged per video frame (matches Audio2Lip window)
+
+
+def _find_audio(audio_dir: str, video_id: str) -> Optional[str]:
+    """Try to find a .wav file matching video_id under audio_dir. Returns None if not found."""
+    stem = os.path.splitext(video_id)[0]
+    for ext in (".wav", ".mp3"):
+        candidate = os.path.join(audio_dir, stem + ext)
+        if os.path.isfile(candidate):
+            return candidate
+    # One level of subdirs
+    for entry in os.scandir(audio_dir):
+        if entry.is_dir():
+            for ext in (".wav", ".mp3"):
+                candidate = os.path.join(entry.path, stem + ext)
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
 
 
 def _find_video(video_dir: str, video_id: str) -> str:
@@ -109,10 +140,13 @@ class AvaMERGDataset(Dataset):
     ):
         self.root = root
         self.video_dir = os.path.join(root, "video_v5_0")
+        self.audio_dir = os.path.join(root, "audio_v5_0")
         self.size = size
         self.identity_gap_min = identity_gap_min
         self.identity_gap_max = identity_gap_max
         self.frames_per_video = frames_per_video
+        # mel cache: audio_path → (N_MELS, T_mel) ndarray
+        self._mel_cache: dict = {}
 
         if split_json is None:
             split_json = os.path.join(root, "train.json")
@@ -129,7 +163,7 @@ class AvaMERGDataset(Dataset):
 
     # ------------------------------------------------------------------
     def _parse_pairs(self, raw: list) -> list:
-        """Normalise JSON entries into {'spk_id', 'lis_id', 'spk_path', 'lis_path'}."""
+        """Normalise JSON entries into {'spk_id', 'lis_id', 'spk_path', 'lis_path', 'spk_audio_path', 'lis_audio_path'}."""
         pairs = []
         for item in raw:
             if isinstance(item, str):
@@ -139,7 +173,9 @@ class AvaMERGDataset(Dataset):
                 spk_path = _find_video(self.video_dir, spk_id)
                 lis_path = _find_video(self.video_dir, lis_id)
                 pairs.append({"spk_id": spk_id, "lis_id": lis_id,
-                               "spk_path": spk_path, "lis_path": lis_path})
+                               "spk_path": spk_path, "lis_path": lis_path,
+                               "spk_audio_path": _find_audio(self.audio_dir, spk_id),
+                               "lis_audio_path": _find_audio(self.audio_dir, lis_id)})
             elif "conversation_id" in item:
                 # Variant C: AvaMERG conversation format
                 pairs.extend(self._parse_avamerg_conversation(item))
@@ -150,7 +186,9 @@ class AvaMERGDataset(Dataset):
                 spk_id = os.path.splitext(os.path.basename(spk_path))[0]
                 lis_id = os.path.splitext(os.path.basename(lis_path))[0]
                 pairs.append({"spk_id": spk_id, "lis_id": lis_id,
-                               "spk_path": spk_path, "lis_path": lis_path})
+                               "spk_path": spk_path, "lis_path": lis_path,
+                               "spk_audio_path": _find_audio(self.audio_dir, spk_id),
+                               "lis_audio_path": _find_audio(self.audio_dir, lis_id)})
             else:
                 # Variant A: ID-based
                 spk_id = item.get("speaker", item.get("speaker_id", ""))
@@ -158,17 +196,23 @@ class AvaMERGDataset(Dataset):
                 spk_path = _find_video(self.video_dir, spk_id)
                 lis_path = _find_video(self.video_dir, lis_id)
                 pairs.append({"spk_id": spk_id, "lis_id": lis_id,
-                               "spk_path": spk_path, "lis_path": lis_path})
+                               "spk_path": spk_path, "lis_path": lis_path,
+                               "spk_audio_path": _find_audio(self.audio_dir, spk_id),
+                               "lis_audio_path": _find_audio(self.audio_dir, lis_id)})
         return pairs
+
+    def _find_video_glob(self, conv_id: str, utt_idx: int):
+        """dia{conv_id}utt{utt_idx}_*.mp4 패턴으로 비디오 탐색. 없으면 None."""
+        pattern = os.path.join(self.video_dir, f"dia{conv_id}utt{utt_idx}_*.mp4")
+        matches = glob.glob(pattern)
+        return matches[0] if matches else None
 
     def _parse_avamerg_conversation(self, item: dict) -> list:
         """Parse one AvaMERG conversation entry into speaker-listener video pairs.
 
         Video naming convention: dia{conv_id}utt{utt_idx}_{speaker_id}.mp4
-
-        For each turn, the speaker's utterance index is taken from
-        dialogue_history[-1]["index"], and the listener's response video is
-        at index + 1.  Pairs where either video is missing are silently skipped.
+        speaker_profile/listener_profile ID가 있으면 직접 사용,
+        없으면 glob으로 탐색.
         """
         conv_id = item["conversation_id"]
         spk_num = item.get("speaker_profile", {}).get("ID", "")
@@ -179,27 +223,66 @@ class AvaMERGDataset(Dataset):
             history = turn.get("dialogue_history", [])
             if not history:
                 continue
-            # The last entry in dialogue_history is the current speaker utterance
             last_utt = history[-1]
             spk_utt_idx = last_utt.get("index", 0)
             lis_utt_idx = spk_utt_idx + 1
 
-            spk_stem = f"dia{conv_id}utt{spk_utt_idx}_{spk_num}"
-            lis_stem = f"dia{conv_id}utt{lis_utt_idx}_{lis_num}"
-
-            try:
-                spk_path = _find_video(self.video_dir, spk_stem)
-                lis_path = _find_video(self.video_dir, lis_stem)
-            except FileNotFoundError:
-                continue
+            # profile ID가 있으면 직접, 없으면 glob
+            if spk_num and lis_num:
+                spk_stem = f"dia{conv_id}utt{spk_utt_idx}_{spk_num}"
+                lis_stem = f"dia{conv_id}utt{lis_utt_idx}_{lis_num}"
+                try:
+                    spk_path = _find_video(self.video_dir, spk_stem)
+                    lis_path = _find_video(self.video_dir, lis_stem)
+                except FileNotFoundError:
+                    continue
+            else:
+                spk_path = self._find_video_glob(conv_id, spk_utt_idx)
+                lis_path = self._find_video_glob(conv_id, lis_utt_idx)
+                if not spk_path or not lis_path:
+                    continue
+                spk_stem = os.path.splitext(os.path.basename(spk_path))[0]
+                lis_stem = os.path.splitext(os.path.basename(lis_path))[0]
 
             pairs.append({
-                "spk_id":   spk_stem,
-                "lis_id":   lis_stem,
-                "spk_path": spk_path,
-                "lis_path": lis_path,
+                "spk_id":        spk_stem,
+                "lis_id":        lis_stem,
+                "spk_path":      spk_path,
+                "lis_path":      lis_path,
+                "spk_audio_path": _find_audio(self.audio_dir, spk_stem),
+                "lis_audio_path": _find_audio(self.audio_dir, lis_stem),
             })
         return pairs
+
+    # ------------------------------------------------------------------
+    def _load_mel_at_frame(self, audio_path: Optional[str], frame_idx: int) -> torch.Tensor:
+        """Return averaged mel feature (N_MELS,) for the video frame at frame_idx.
+
+        Caches the full mel spectrogram per audio file to avoid redundant I/O.
+        Returns a zero tensor if audio_path is None or the file is missing.
+        """
+        if audio_path is None or not os.path.isfile(audio_path):
+            return torch.zeros(_N_MELS, dtype=torch.float32)
+
+        if audio_path not in self._mel_cache:
+            wav = _audio_utils.load_wav(audio_path, sr=_SR)
+            mel = _audio_utils.melspectrogram(wav)       # (N_MELS, T_mel)
+            self._mel_cache[audio_path] = mel
+
+        mel = self._mel_cache[audio_path]                # (N_MELS, T_mel)
+        mel_start = int(frame_idx * _SR / _FPS / _HOP)
+        mel_end   = mel_start + _MEL_WIN
+
+        if mel_start >= mel.shape[1]:
+            return torch.zeros(_N_MELS, dtype=torch.float32)
+
+        mel_slice = mel[:, mel_start:mel_end]            # (N_MELS, ≤_MEL_WIN)
+        if mel_slice.shape[1] < _MEL_WIN:
+            pad = _MEL_WIN - mel_slice.shape[1]
+            mel_slice = np.pad(mel_slice, ((0, 0), (0, pad)), mode="edge")
+
+        avg_mel = mel_slice.mean(axis=1).astype(np.float32)  # (N_MELS,)
+        return torch.from_numpy(avg_mel)
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -227,9 +310,14 @@ class AvaMERGDataset(Dataset):
         cap_spk.release()
         cap_lis.release()
 
+        speaker_mel  = self._load_mel_at_frame(pair.get("spk_audio_path"), t)
+        listener_mel = self._load_mel_at_frame(pair.get("lis_audio_path"), t)
+
         return {
             "speaker_frame":   speaker_frame,
             "listener_source": listener_source,
             "listener_target": listener_target,
+            "speaker_mel":     speaker_mel,
+            "listener_mel":    listener_mel,
             "pair_id": f"{pair['spk_id']}#{pair['lis_id']}@{t}",
         }

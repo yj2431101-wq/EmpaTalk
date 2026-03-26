@@ -108,11 +108,14 @@ class ListenerBank(nn.Module):
         ``alpha_D_lip``).  Pose and expression are **stochastically sampled**
         through independent :class:`ReactionVAE` modules, giving diverse
         reactions conditioned on the same speaker context.
+        Audio features are also stochastically generated via ``audio_vae``
+        and projected to mel-bin space through ``audio_mlp``.
 
     Args:
         num_prototypes:  Number of prototype vectors per bank (K).
         feature_dim:     Dimensionality of each prototype vector (default 512).
         vae_latent_dim:  Latent dimension of the ReactionVAE (default 64).
+        audio_dim:       Output dimensionality of the audio MLP (mel bins, default 80).
         mirror_alpha_p:  Fixed scale for passive pose mirroring (default 0.2).
         mirror_alpha_e:  Fixed scale for passive expression mirroring (default 0.2).
     """
@@ -122,6 +125,9 @@ class ListenerBank(nn.Module):
         num_prototypes: int = 32,
         feature_dim: int = 512,
         vae_latent_dim: int = 64,
+        audio_dim: int = 80,
+        pose_dim: int = 6,
+        exp_dim: int = 10,
         mirror_alpha_p: float = 0.2,
         mirror_alpha_e: float = 0.2,
     ):
@@ -130,10 +136,11 @@ class ListenerBank(nn.Module):
         self.mirror_alpha_p = mirror_alpha_p
         self.mirror_alpha_e = mirror_alpha_e
 
-        # --- Three learnable prototype banks  (K, D) each ---
-        self.lip_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim))
-        self.pose_bank = nn.Parameter(torch.randn(num_prototypes, feature_dim))
-        self.exp_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim))
+        # --- Learnable prototype banks  (K, D) each ---
+        self.lip_bank   = nn.Parameter(torch.randn(num_prototypes, feature_dim))
+        self.pose_bank  = nn.Parameter(torch.randn(num_prototypes, feature_dim))
+        self.exp_bank   = nn.Parameter(torch.randn(num_prototypes, feature_dim))
+        self.audio_bank = nn.Parameter(torch.randn(num_prototypes, feature_dim))
 
         # --- Per-bank cross-attention projections ---
         self.lip_q  = EqualLinear(feature_dim, feature_dim)
@@ -148,6 +155,10 @@ class ListenerBank(nn.Module):
         self.exp_k  = EqualLinear(feature_dim, feature_dim)
         self.exp_v  = EqualLinear(feature_dim, feature_dim)
 
+        self.audio_q = EqualLinear(feature_dim, feature_dim)
+        self.audio_k = EqualLinear(feature_dim, feature_dim)
+        self.audio_v = EqualLinear(feature_dim, feature_dim)
+
         # --- Fusion: cat(latent_poseD_S, directions_D_L) → motion offset ---
         self.speaker_fusion = nn.Sequential(
             EqualLinear(feature_dim * 2, feature_dim),
@@ -155,10 +166,40 @@ class ListenerBank(nn.Module):
             EqualLinear(feature_dim, feature_dim),
         )
 
-        # --- Stochastic VAE heads for active reaction (pose + exp only) ---
+        # --- Stochastic VAE heads for active reaction (pose + exp + audio) ---
         # Lip features in active mode come from TTS audio, not the VAE.
-        self.pose_vae = ReactionVAE(feature_dim, vae_latent_dim)
-        self.exp_vae  = ReactionVAE(feature_dim, vae_latent_dim)
+        self.pose_vae  = ReactionVAE(feature_dim, vae_latent_dim)
+        self.exp_vae   = ReactionVAE(feature_dim, vae_latent_dim)
+        self.audio_vae = ReactionVAE(feature_dim, vae_latent_dim)
+
+        # --- Audio MLP: feature_dim → audio_dim (mel reconstruction head) ---
+        # Projects VAE output into mel-bin space for audio reconstruction.
+        self.audio_mlp = nn.Sequential(
+            EqualLinear(feature_dim, feature_dim),
+            nn.LeakyReLU(0.2),
+            EqualLinear(feature_dim, audio_dim),
+        )
+
+        # --- Speaker audio query projection: audio_dim → feature_dim ---
+        self.speaker_audio_proj = nn.Sequential(
+            EqualLinear(audio_dim, feature_dim),
+            nn.LeakyReLU(0.2),
+            EqualLinear(feature_dim, feature_dim),
+        )
+
+        # --- Listener-specific motion FC heads ---
+        # Replaces speaker's pose_fc/exp_fc so the bank output distribution
+        # doesn't need to match the speaker's W-space.
+        self.listener_pose_fc = nn.Sequential(
+            EqualLinear(feature_dim, feature_dim // 2),
+            nn.LeakyReLU(0.2),
+            EqualLinear(feature_dim // 2, pose_dim),
+        )
+        self.listener_exp_fc = nn.Sequential(
+            EqualLinear(feature_dim, feature_dim // 2),
+            nn.LeakyReLU(0.2),
+            EqualLinear(feature_dim // 2, exp_dim),
+        )
 
     # ------------------------------------------------------------------
     def _attend(self, q_proj, k_proj, v_proj, bank, query):
@@ -183,21 +224,22 @@ class ListenerBank(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, latent_poseD_S: torch.Tensor):
-        """Retrieve three listener features using the speaker's pre-decoder latent.
+        """Retrieve four listener features using the speaker's pre-decoder latent.
 
         Args:
             latent_poseD_S: Speaker's pre-decoder latent ``wa_S + directions_D_S``,
                             shape (B, feature_dim).
 
         Returns:
-            f_lip, f_pose, f_exp:               Retrieved features, each (B, D).
-            attn_lip, attn_pose, attn_exp:      Attention weights,   each (B, K).
+            f_lip, f_pose, f_exp, f_audio:                  Retrieved features, each (B, D).
+            attn_lip, attn_pose, attn_exp, attn_audio:      Attention weights,   each (B, K).
         """
-        f_lip,  attn_lip  = self._attend(self.lip_q,  self.lip_k,  self.lip_v,  self.lip_bank,  latent_poseD_S)
-        f_pose, attn_pose = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)
-        f_exp,  attn_exp  = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S)
+        f_lip,   attn_lip   = self._attend(self.lip_q,   self.lip_k,   self.lip_v,   self.lip_bank,   latent_poseD_S)
+        f_pose,  attn_pose  = self._attend(self.pose_q,  self.pose_k,  self.pose_v,  self.pose_bank,  latent_poseD_S)
+        f_exp,   attn_exp   = self._attend(self.exp_q,   self.exp_k,   self.exp_v,   self.exp_bank,   latent_poseD_S)
+        f_audio, attn_audio = self._attend(self.audio_q, self.audio_k, self.audio_v, self.audio_bank, latent_poseD_S)
 
-        return f_lip, f_pose, f_exp, attn_lip, attn_pose, attn_exp
+        return f_lip, f_pose, f_exp, f_audio, attn_lip, attn_pose, attn_exp, attn_audio
 
     # ------------------------------------------------------------------
     def fuse(self, wa_S: torch.Tensor, directions_D_L: torch.Tensor):
@@ -251,7 +293,9 @@ class ListenerBank(nn.Module):
         f_pose_final = f_pose_L + self.mirror_alpha_p * scale_p * f_pose_S
         f_exp_final  = f_exp_L  + self.mirror_alpha_e * scale_e * f_exp_S
 
-        return f_pose_final, f_exp_final
+        alpha_D_pose = self.listener_pose_fc(f_pose_final)
+        alpha_D_exp  = self.listener_exp_fc(f_exp_final)
+        return alpha_D_pose, alpha_D_exp
 
     # ------------------------------------------------------------------
     def forward_active(
@@ -259,44 +303,45 @@ class ListenerBank(nn.Module):
         latent_poseD_S: torch.Tensor,
         wa_S: torch.Tensor = None,
         training: bool = True,
+        speaker_audio_feat: torch.Tensor = None,
     ):
         """Stage 3 — active empathic reaction with stochastic pose/expression.
 
-        Pose and expression are sampled from the learned conditional
-        distribution via :class:`ReactionVAE`.  Lip motion is **not** produced
-        here; it must be supplied externally from the TTS audio path
-        (``alpha_D_lip`` in :meth:`Generator.forward_listener`).
-
         Args:
-            latent_poseD_S: (B, D) speaker pre-decoder latent (used for bank retrieval only).
-            wa_S:           (B, D) speaker appearance code without motion (used as VAE context).
-                            If None, falls back to latent_poseD_S (backward compat).
-            training:       If True, use reparameterization sampling;
-                            if False, use μ (deterministic mean).
+            latent_poseD_S:     (B, D) speaker pre-decoder latent (visual).
+            wa_S:               (B, D) speaker appearance code (VAE context).
+            training:           If True, reparameterization sampling.
+            speaker_audio_feat: (B, audio_dim) speaker mel.
+                                Combined with visual query for pose/exp banks
+                                so speech content modulates which listener
+                                reactions are retrieved.
 
         Returns:
-            f_pose:   (B, D) sampled listener pose feature.
-            f_exp:    (B, D) sampled listener expression feature.
-            mu_p:     (B, latent_dim) pose VAE mean.
-            logvar_p: (B, latent_dim) pose VAE log-variance.
-            mu_e:     (B, latent_dim) expression VAE mean.
-            logvar_e: (B, latent_dim) expression VAE log-variance.
+            alpha_D_pose, alpha_D_exp, audio_mel,
+            mu_p, logvar_p, mu_e, logvar_e, mu_a, logvar_a
         """
-        # Use motion-free speaker appearance as VAE context to prevent the VAE
-        # from copying speaker head/expression motion onto the listener.
         vae_ctx = wa_S if wa_S is not None else latent_poseD_S
 
-        # Query only pose and exp banks — lip bank is not used in active mode
-        # (lip is driven by TTS audio externally).  Skipping lip_bank avoids
-        # computing gradients for parameters that would never be updated.
-        f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)
-        f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S)
+        # Combined query: visual + audio for pose/exp banks
+        # Audio shifts the retrieval toward empathetically relevant reactions.
+        if speaker_audio_feat is not None:
+            audio_proj = self.speaker_audio_proj(speaker_audio_feat)  # (B, D)
+            pose_exp_query = latent_poseD_S + audio_proj
+            audio_query    = audio_proj
+        else:
+            pose_exp_query = latent_poseD_S
+            audio_query    = latent_poseD_S
 
-        f_pose, mu_p, logvar_p = self.pose_vae(
-            vae_ctx, f_pose_L, deterministic=not training
-        )
-        f_exp, mu_e, logvar_e = self.exp_vae(
-            vae_ctx, f_exp_L, deterministic=not training
-        )
+        f_pose_L,  _ = self._attend(self.pose_q,  self.pose_k,  self.pose_v,  self.pose_bank,  pose_exp_query)
+        f_exp_L,   _ = self._attend(self.exp_q,   self.exp_k,   self.exp_v,   self.exp_bank,   pose_exp_query)
+        f_audio_L, _ = self._attend(self.audio_q, self.audio_k, self.audio_v, self.audio_bank, audio_query)
 
-        return f_pose, f_exp, mu_p, logvar_p, mu_e, logvar_e
+        f_pose,      mu_p, logvar_p = self.pose_vae(vae_ctx,  f_pose_L,  deterministic=not training)
+        f_exp,       mu_e, logvar_e = self.exp_vae(vae_ctx,   f_exp_L,   deterministic=not training)
+        f_audio_feat, mu_a, logvar_a = self.audio_vae(vae_ctx, f_audio_L, deterministic=not training)
+
+        audio_mel    = self.audio_mlp(f_audio_feat)         # (B, audio_dim)
+        alpha_D_pose = self.listener_pose_fc(f_pose)        # (B, pose_dim)
+        alpha_D_exp  = self.listener_exp_fc(f_exp)          # (B, exp_dim)
+
+        return alpha_D_pose, alpha_D_exp, audio_mel, mu_p, logvar_p, mu_e, logvar_e, mu_a, logvar_a

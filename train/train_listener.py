@@ -28,6 +28,10 @@ import shutil
 # Ensure EDTalk root is on sys.path when run as `python train/train_listener.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -48,11 +52,29 @@ torch.backends.cudnn.benchmark = True
 
 # ---------------------------------------------------------------------------
 
-def write_loss(step, vgg, l1, adv, kl, d, writer: SummaryWriter):
+def plot_losses(history: dict, save_path: str):
+    """6개 loss를 2x3 그리드로 저장."""
+    keys = ["vgg", "l1", "adv", "kl", "mel", "d"]
+    labels = ["VGG", "L1", "Adv(G)", "KL", "Mel", "Dis"]
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
+    fig.suptitle("ListenerBank Training Loss", fontsize=13)
+    for ax, key, label in zip(axes.flat, keys, labels):
+        iters, vals = zip(*history[key]) if history[key] else ([], [])
+        ax.plot(iters, vals, linewidth=1.2)
+        ax.set_title(label)
+        ax.set_xlabel("iter")
+        ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    plt.close(fig)
+
+
+def write_loss(step, vgg, l1, adv, kl, mel, d, writer: SummaryWriter):
     writer.add_scalar("listener/vgg_loss", vgg.item(), step)
     writer.add_scalar("listener/l1_loss",  l1.item(),  step)
     writer.add_scalar("listener/adv_g",    adv.item(), step)
     writer.add_scalar("listener/kl_loss",  kl.item(),  step)
+    writer.add_scalar("listener/mel_loss", mel.item(), step)
     writer.add_scalar("listener/dis_loss", d.item(),   step)
     writer.flush()
 
@@ -137,6 +159,8 @@ def main(args):
     # ------------------------------------------------------------------ #
     print("==> training")
     last_sample_path = None
+    loss_history = {k: [] for k in ["vgg", "l1", "adv", "kl", "mel", "d"]}
+    plot_path = os.path.join(ckpt_path, "loss_plot.png")
 
     epoch_bar = tqdm(range(args.epoch), desc="Epoch", unit="epoch",
                      position=0, dynamic_ncols=True, file=sys.stderr)
@@ -158,9 +182,11 @@ def main(args):
         for batch in batch_bar:
             current_iter += 1
 
-            img_spk = batch["speaker_frame"].to(device)
-            img_src = batch["listener_source"].to(device)
-            img_tgt = batch["listener_target"].to(device)
+            img_spk  = batch["speaker_frame"].to(device)
+            img_src  = batch["listener_source"].to(device)
+            img_tgt  = batch["listener_target"].to(device)
+            mel_spk  = batch["speaker_mel"].to(device)    # (B, N_MELS) speaker audio query
+            mel_tgt  = batch["listener_mel"].to(device)   # (B, N_MELS) listener mel GT
 
             # KL warmup: linearly ramp from 0 → lambda_kl over kl_warmup_iters
             if args.training_mode == 'active' and args.lambda_kl > 0:
@@ -169,33 +195,36 @@ def main(args):
                 kl_weight = 0.0
 
             # Generator step
-            vgg_loss, l1_loss, adv_loss, kl_loss, img_recon = trainer.gen_update(
-                img_spk, img_src, img_tgt, kl_weight=kl_weight
+            vgg_loss, l1_loss, adv_loss, kl_loss, mel_loss, img_recon = trainer.gen_update(
+                img_spk, img_src, img_tgt,
+                kl_weight=kl_weight,
+                mel_listener_tgt=mel_tgt,
+                speaker_audio_mel=mel_spk,
             )
 
             # Discriminator step
             d_loss = trainer.dis_update(img_tgt, img_recon)
 
-            # ---- 진행바 실시간 loss 표시 ----
-            batch_bar.set_postfix(
-                vgg=f"{vgg_loss.item():.3f}",
-                l1=f"{l1_loss.item():.3f}",
-                adv=f"{adv_loss.item():.3f}",
-                kl=f"{kl_loss.item():.3f}",
-                d=f"{d_loss.item():.3f}",
-            )
+            # ---- 실시간 loss 출력 + 그래프 업데이트 ----
+            if is_main:
+                for k, v in zip(
+                    ["vgg", "l1", "adv", "kl", "mel", "d"],
+                    [vgg_loss, l1_loss, adv_loss, kl_loss, mel_loss, d_loss],
+                ):
+                    loss_history[k].append((current_iter, v.item()))
 
-            # ---- logging (rank 0 only) ----
-            if is_main and current_iter % args.log_iter == 0:
-                write_loss(current_iter, vgg_loss, l1_loss, adv_loss, kl_loss, d_loss, writer)
-
-            if is_main and current_iter % args.display_freq == 0:
-                tqdm.write(
-                    f"[Epoch {epoch}/{args.epoch}] [Iter {current_iter}] "
-                    f"vgg={vgg_loss.item():.4f}  l1={l1_loss.item():.4f}  "
-                    f"adv={adv_loss.item():.4f}  kl={kl_loss.item():.4f}  "
-                    f"d={d_loss.item():.4f}"
+            if is_main and current_iter % args.print_freq == 0:
+                print(
+                    f"[E{epoch:03d}/{args.epoch}][I{current_iter:06d}] "
+                    f"vgg={vgg_loss.item():.4f} "
+                    f"l1={l1_loss.item():.4f} "
+                    f"adv={adv_loss.item():.4f} "
+                    f"kl={kl_loss.item():.4f} "
+                    f"mel={mel_loss.item():.4f} "
+                    f"d={d_loss.item():.4f}",
+                    flush=True,
                 )
+                plot_losses(loss_history, plot_path)
 
             # ---- sample images (rank 0 only) ----
             if is_main and current_iter % args.image_save_iter == 0:
@@ -258,6 +287,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_listener_prototypes", type=int, default=32)
     parser.add_argument("--vae_latent_dim",  type=int,   default=64,
                         help="Latent dimension of ReactionVAE (pose + exp heads)")
+    parser.add_argument("--audio_dim",       type=int,   default=80,
+                        help="Output dimension of audio MLP (mel bins)")
     parser.add_argument("--mirror_alpha_p",  type=float, default=0.2,
                         help="Passive pose mirroring scale α_p ∈ [0, 1]")
     parser.add_argument("--mirror_alpha_e",  type=float, default=0.2,
@@ -268,6 +299,9 @@ if __name__ == "__main__":
                         help="Path to pretrained EDTalk .pt checkpoint")
     parser.add_argument("--resume_ckpt", type=str, default=None,
                         help="Path to listener training checkpoint to resume")
+    parser.add_argument("--audio2lip_ckpt", type=str, default=None,
+                        help="Path to Audio2Lip .pt checkpoint (ckpts/Audio2Lip.pt). "
+                             "If provided, predicted mel drives lip motion via Audio2Lip.")
 
     # Optimiser
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -278,6 +312,8 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_adv", type=float, default=0.1)
     parser.add_argument("--lambda_kl",  type=float, default=0.01,
                         help="KL loss weight for ReactionVAE (active mode only)")
+    parser.add_argument("--lambda_mel", type=float, default=1.0,
+                        help="Mel reconstruction loss weight for audio_vae output")
     parser.add_argument("--kl_warmup_iters", type=int, default=5000,
                         help="Iterations to linearly ramp KL weight from 0 to lambda_kl")
     parser.add_argument("--training_mode", type=str, default="active",
@@ -293,7 +329,8 @@ if __name__ == "__main__":
     parser.add_argument("--exp_path",       type=str, default="./listener_exp")
     parser.add_argument("--exp_name",       type=str, default="v1")
     parser.add_argument("--log_iter",       type=int, default=10)
-    parser.add_argument("--display_freq",   type=int, default=50)
+    parser.add_argument("--print_freq",     type=int, default=10,
+                        help="매 N iter마다 loss 출력 (stdout, flush=True)")
     parser.add_argument("--image_save_iter",type=int, default=500)
     parser.add_argument("--save_freq",      type=int, default=2000)
 

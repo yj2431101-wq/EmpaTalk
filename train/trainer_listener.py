@@ -9,7 +9,8 @@ Loss (active mode):
     L = λ_vgg * VGG_perceptual(pred, gt)
       + λ_l1  * L1(pred, gt)
       + λ_adv * GAN_gen(D(pred))
-      + kl_weight * KL(N(μ,σ) || N(0,I))   ← pose_vae + exp_vae
+      + kl_weight * KL(N(μ,σ) || N(0,I))   ← pose_vae + exp_vae + audio_vae
+      + λ_mel * L1(audio_mel, mel_gt)       ← mel reconstruction
 
 Loss (passive mode):
     L = λ_vgg * VGG_perceptual(pred, gt)
@@ -72,6 +73,8 @@ class TrainerListener(nn.Module):
             channel_multiplier=args.channel_multiplier,
             num_listener_prototypes=getattr(args, 'num_listener_prototypes', 16),
             vae_latent_dim=getattr(args, 'vae_latent_dim', 64),
+            audio_dim=getattr(args, 'audio_dim', 80),
+            audio2lip_ckpt=getattr(args, 'audio2lip_ckpt', None),
             mirror_alpha_p=getattr(args, 'mirror_alpha_p', 0.3),
             mirror_alpha_e=getattr(args, 'mirror_alpha_e', 0.3),
         ).to(device)
@@ -110,6 +113,7 @@ class TrainerListener(nn.Module):
         self.lambda_vgg = getattr(args, "lambda_vgg", 1.0)
         self.lambda_l1  = getattr(args, "lambda_l1",  1.0)
         self.lambda_adv = getattr(args, "lambda_adv",  0.1)
+        self.lambda_mel = getattr(args, "lambda_mel",  1.0)
 
         self.start_iter = 0
 
@@ -183,6 +187,8 @@ class TrainerListener(nn.Module):
         img_listener_src: torch.Tensor,
         img_listener_tgt: torch.Tensor,
         kl_weight: float = 0.0,
+        mel_listener_tgt: torch.Tensor = None,
+        speaker_audio_mel: torch.Tensor = None,
     ):
         """One generator step.
 
@@ -191,9 +197,11 @@ class TrainerListener(nn.Module):
             img_listener_src: (B, 3, H, W)  Listener identity/source frame.
             img_listener_tgt: (B, 3, H, W)  Ground-truth listener target frame.
             kl_weight:        Current KL loss weight (supports warmup schedule).
+            mel_listener_tgt: (B, audio_dim) Ground-truth listener mel features.
+                              If None, mel reconstruction loss is skipped.
 
         Returns:
-            vgg_loss, l1_loss, adv_loss, kl_loss, img_recon
+            vgg_loss, l1_loss, adv_loss, kl_loss, mel_loss, img_recon
         """
         self.gen.train()
         self.gen.zero_grad()
@@ -201,34 +209,44 @@ class TrainerListener(nn.Module):
         _requires_grad(self._raw_gen.listener_bank, True)
         _requires_grad(self._raw_dis, False)
 
-        img_recon, _, _, _, mu_p, logvar_p, mu_e, logvar_e = self._raw_gen.forward_listener(
-            img_speaker, img_listener_src,
-            mode=self.training_mode,
-            training=True,
-        )
+        img_recon, _, _, _, mu_p, logvar_p, mu_e, logvar_e, audio_mel, mu_a, logvar_a = \
+            self._raw_gen.forward_listener(
+                img_speaker, img_listener_src,
+                mode=self.training_mode,
+                speaker_audio_mel=speaker_audio_mel,
+                training=True,
+            )
 
         adv_pred = self.dis(img_recon)
         vgg_loss = self.criterion_vgg(img_recon, img_listener_tgt).mean()
         l1_loss  = F.l1_loss(img_recon, img_listener_tgt)
         adv_loss = F.softplus(-adv_pred).mean()
 
-        # KL loss — only computed in active mode (VAE is not used in passive)
+        # KL loss — pose + exp + audio VAEs (active mode only)
         kl_loss = torch.zeros(1, device=self.device)
         if mu_p is not None and kl_weight > 0.0:
             kl_loss = (
-                self._kl_loss(mu_p, logvar_p) + self._kl_loss(mu_e, logvar_e)
+                self._kl_loss(mu_p, logvar_p)
+                + self._kl_loss(mu_e, logvar_e)
+                + self._kl_loss(mu_a, logvar_a)
             ) * kl_weight
+
+        # Mel reconstruction loss
+        mel_loss = torch.zeros(1, device=self.device)
+        if audio_mel is not None and mel_listener_tgt is not None:
+            mel_loss = F.l1_loss(audio_mel, mel_listener_tgt) * self.lambda_mel
 
         g_loss = (
             self.lambda_vgg * vgg_loss
             + self.lambda_l1  * l1_loss
             + self.lambda_adv * adv_loss
             + kl_loss
+            + mel_loss
         )
         g_loss.backward()
         self.g_optim.step()
 
-        return vgg_loss, l1_loss, adv_loss, kl_loss, img_recon.detach()
+        return vgg_loss, l1_loss, adv_loss, kl_loss, mel_loss, img_recon.detach()
 
     def dis_update(
         self,
@@ -293,10 +311,12 @@ class TrainerListener(nn.Module):
 
         f_pose = lb.pose_vae.decode(z_pose, wa_L)
         f_exp  = lb.exp_vae.decode(z_exp,  wa_L)
+        z_audio = torch.randn(B, lb.audio_vae.latent_dim, device=device)
+        f_audio = lb.audio_vae.decode(z_audio, wa_L)
 
         alpha_D_lip  = torch.zeros(B, self._raw_gen.lip_dim, device=device)
-        alpha_D_pose = self._raw_gen.pose_fc(self._raw_gen.fc(f_pose)) * motion_scale
-        alpha_D_exp  = self._raw_gen.exp_fc(self._raw_gen.fc(f_exp))  * motion_scale
+        alpha_D_pose = lb.listener_pose_fc(f_pose) * motion_scale
+        alpha_D_exp  = lb.listener_exp_fc(f_exp)   * motion_scale
         alpha_D_L    = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
         a_L          = self._raw_gen.direction_exp.get_shared_out(alpha_D_L, self._raw_gen.direction_lipnonlip.weight)
         e_L          = self._raw_gen.direction_exp.get_exp_latent(a_L)
@@ -323,16 +343,18 @@ class TrainerListener(nn.Module):
         B, device = latent_poseD_S.size(0), latent_poseD_S.device
 
         if self.training_mode == 'passive':
-            f_pose, f_exp = lb.forward_passive(latent_poseD_S, f_pose_S, f_exp_S)
+            alpha_D_pose, alpha_D_exp = lb.forward_passive(latent_poseD_S, f_pose_S, f_exp_S)
         else:
-            f_pose_L, _ = lb._attend(lb.pose_q, lb.pose_k, lb.pose_v, lb.pose_bank, latent_poseD_S)
-            f_exp_L,  _ = lb._attend(lb.exp_q,  lb.exp_k,  lb.exp_v,  lb.exp_bank,  latent_poseD_S)
-            f_pose, *_ = lb.pose_vae(wa_L, f_pose_L, deterministic=False)
-            f_exp,  *_ = lb.exp_vae(wa_L, f_exp_L,  deterministic=False)
+            f_pose_L,  _ = lb._attend(lb.pose_q,  lb.pose_k,  lb.pose_v,  lb.pose_bank,  latent_poseD_S)
+            f_exp_L,   _ = lb._attend(lb.exp_q,   lb.exp_k,   lb.exp_v,   lb.exp_bank,   latent_poseD_S)
+            f_audio_L, _ = lb._attend(lb.audio_q, lb.audio_k, lb.audio_v, lb.audio_bank, latent_poseD_S)
+            f_pose,    *_ = lb.pose_vae(wa_L, f_pose_L,  deterministic=False)
+            f_exp,     *_ = lb.exp_vae(wa_L,  f_exp_L,   deterministic=False)
+            f_audio,   *_ = lb.audio_vae(wa_L, f_audio_L, deterministic=False)
+            alpha_D_pose = lb.listener_pose_fc(f_pose) * motion_scale
+            alpha_D_exp  = lb.listener_exp_fc(f_exp)   * motion_scale
 
         alpha_D_lip  = torch.zeros(B, gen.lip_dim, device=device)
-        alpha_D_pose = gen.pose_fc(gen.fc(f_pose)) * motion_scale
-        alpha_D_exp  = gen.exp_fc(gen.fc(f_exp))   * motion_scale
         alpha_D_L    = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
         a_L          = gen.direction_exp.get_shared_out(alpha_D_L, gen.direction_lipnonlip.weight)
         e_L          = gen.direction_exp.get_exp_latent(a_L)
@@ -370,8 +392,31 @@ class TrainerListener(nn.Module):
     def resume(self, ckpt_path: str) -> int:
         print(f"Resuming listener training from: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        self._raw_gen.listener_bank.load_state_dict(ckpt["listener_bank"])
+
+        # Load listener_bank with strict=False so that newly added audio modules
+        # (audio_bank, audio_q/k/v, audio_vae, audio_mlp) remain randomly
+        # initialised when resuming from a checkpoint trained without them.
+        lb_state = ckpt["listener_bank"]
+        missing, unexpected = self._raw_gen.listener_bank.load_state_dict(
+            lb_state, strict=False
+        )
+        audio_missing  = [k for k in missing    if "audio" in k]
+        other_missing  = [k for k in missing    if "audio" not in k]
+        if other_missing:
+            print(f"  [WARNING] Unexpected missing keys: {other_missing}")
+        if audio_missing:
+            print(f"  Audio modules not in ckpt (randomly init'd): {len(audio_missing)} keys")
+        if unexpected:
+            print(f"  [WARNING] Unexpected keys in ckpt: {unexpected}")
+
         self._raw_dis.load_state_dict(ckpt["dis"])
-        self.g_optim.load_state_dict(ckpt["g_optim"])
-        self.d_optim.load_state_dict(ckpt["d_optim"])
+
+        # If audio modules were missing, the optimizer parameter groups have changed
+        # (new params added), so the old optimizer state is incompatible — skip it.
+        if not audio_missing:
+            self.g_optim.load_state_dict(ckpt["g_optim"])
+            self.d_optim.load_state_dict(ckpt["d_optim"])
+        else:
+            print("  Skipping optimizer state (parameter groups changed due to new audio modules)")
+
         return ckpt.get("start_iter", 0)

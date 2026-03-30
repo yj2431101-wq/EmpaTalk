@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>EDTalk ListenerBank 학습 플로우차트</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 8px; }
+    p  { font-size: 0.9rem; color: #a6adc8; margin-bottom: 32px; }
+    .mermaid {
+      background: #ffffff;
+      border-radius: 12px;
+      padding: 32px;
+      max-width: 960px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <h1>EDTalk — ListenerBank 학습 플로우차트</h1>
+  <p>🔒 Frozen: pretrained EDTalk &nbsp;|&nbsp; 🔥 학습 대상: ListenerBank (prototype banks + attention + fusion MLP)</p>
+
+  <div class="mermaid">
+flowchart TD
+    subgraph INPUT["📦 입력 데이터 (AvaMERG)"]
+        SPK["🎤 Speaker Frame\n시간 t의 화자 얼굴"]
+        LIS_SRC["👤 Listener Source\n청자 Identity 프레임 (t - gap)"]
+        LIS_TGT["🎯 Listener Target GT\n시간 t의 실제 청자 얼굴"]
+    end
+
+    subgraph FROZEN["🔒 Frozen — pretrained EDTalk"]
+        ENC_S["Encoder (Speaker)"]
+        ENC_L["Encoder (Listener)"]
+        FC["fc / lip_fc / pose_fc / exp_fc"]
+        DIR["Direction Network"]
+        DEC["StyleGAN Decoder"]
+        DIS["Discriminator D"]
+    end
+
+    subgraph TRAINABLE["🔥 학습 대상 — ListenerBank"]
+        LIP_BANK["Lip Bank\nK × 512 prototypes"]
+        POSE_BANK["Pose Bank\nK × 512 prototypes"]
+        EXP_BANK["Exp Bank\nK × 512 prototypes"]
+        ATTN["Cross-Attention\nQ / K / V projections × 3"]
+        FUSION["Speaker Fusion MLP\ncat(latent_S, dir_L) → offset"]
+    end
+
+    subgraph LOSS["📉 Loss (역전파 → ListenerBank만)"]
+        L_VGG["VGG Perceptual Loss"]
+        L_L1["L1 Loss"]
+        L_ADV["Adversarial Loss (GAN)"]
+    end
+
+    SPK --> ENC_S
+    ENC_S -->|"wa_S + directions_D_S\n= latent_poseD_S (512d)"| ATTN
+
+    ATTN -->|query| LIP_BANK
+    ATTN -->|query| POSE_BANK
+    ATTN -->|query| EXP_BANK
+
+    LIP_BANK -->|f_lip| FC
+    POSE_BANK -->|f_pose| FC
+    EXP_BANK -->|f_exp| FC
+
+    FC --> DIR
+    DIR -->|directions_D_L| FUSION
+    ENC_S -->|latent_poseD_S| FUSION
+
+    LIS_SRC --> ENC_L
+    ENC_L -->|"wa_L + spatial feats"| FUSION
+
+    FUSION -->|"latent_poseD_L = wa_L + fused"| DEC
+    ENC_L -->|"feats_L, e_L"| DEC
+
+    DEC -->|img_recon| L_VGG
+    DEC -->|img_recon| L_L1
+    DEC -->|img_recon| DIS
+
+    LIS_TGT --> L_VGG
+    LIS_TGT --> L_L1
+    DIS --> L_ADV
+
+    L_VGG -->|backprop| TRAINABLE
+    L_L1  -->|backprop| TRAINABLE
+    L_ADV -->|backprop| TRAINABLE
+  </div>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+  </script>
+</body>
+</html>

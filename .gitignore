@@ -1,0 +1,12 @@
+﻿ckpts/
+datasets/
+res/
+fine_tune/
+listener_exp/
+listener_exp_v2/
+__pycache__/
+*.pth
+*.zip
+*.tar.gz
+.ipynb_checkpoints/
+.idea/

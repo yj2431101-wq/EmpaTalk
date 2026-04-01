@@ -184,10 +184,10 @@ def main(args):
         for batch in batch_bar:
             current_iter += 1
 
-            img_spk  = batch["speaker_frame"].to(device)
-            img_src  = batch["listener_source"].to(device)
-            img_tgt  = batch["listener_target"].to(device)
-            mel_tgt  = batch["listener_mel"].to(device)   # (B, N_MELS)
+            img_spk  = batch["speaker_video"].to(device) # (B, T, C, H, W)
+            img_src  = batch["listener_source"].to(device) # (B, C, H, W)
+            img_tgt  = batch["listener_target"].to(device) # (B, T, C, H, W)
+            mel_tgt  = batch["listener_mel"].to(device)   # (B, T, N_MELS)
 
             # KL warmup: linearly ramp from 0 → lambda_kl over kl_warmup_iters
             if args.training_mode == 'active' and args.lambda_kl > 0:

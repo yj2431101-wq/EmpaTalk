@@ -177,26 +177,48 @@ class TrainerListener(nn.Module):
         kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, latent_dim)
         return torch.clamp(kl_per_dim, min=free_bits).mean()
 
+    def _bank_sequence_loss(self, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """Match sequence-level distribution of bank coefficients, not per-frame.
+
+        Instead of enforcing frame-by-frame correspondence, we align the
+        mean and variance of pred and tgt across the T dimension so that
+        the overall reaction pattern matches without being locked to a
+        specific frame index.
+
+        Args:
+            pred: (B, T, dim) predicted bank coefficients.
+            tgt:  (B, T, dim) ground-truth bank coefficients.
+        Returns:
+            Scalar loss.
+        """
+        # Mean across T: overall level of reaction across the utterance.
+        mean_loss = F.l1_loss(pred.mean(dim=1), tgt.mean(dim=1))
+
+        # Std across T: how much the reaction varies over the utterance.
+        std_loss = F.l1_loss(pred.std(dim=1), tgt.std(dim=1))
+
+        return mean_loss + std_loss
+
     # ------------------------------------------------------------------ #
     #  Training steps                                                      #
     # ------------------------------------------------------------------ #
 
     def gen_update(
-        self,
-        img_speaker: torch.Tensor,
-        img_listener_src: torch.Tensor,
-        img_listener_tgt: torch.Tensor,
-        kl_weight: float = 0.0,
-        mel_listener_tgt: torch.Tensor = None,
+            self,
+            img_speaker: torch.Tensor,  # (B, T, C, H, W)
+            img_listener_src: torch.Tensor,  # (B, C, H, W)
+            img_listener_tgt: torch.Tensor,  # (B, T, C, H, W)
+            kl_weight: float = 0.0,
+            mel_listener_tgt: torch.Tensor = None,  # (B, T, audio_dim)
     ):
-        """One generator step.
+        """One generator step over a full utterance sequence.
 
         Args:
-            img_speaker:      (B, 3, H, W)  Speaker frame.
-            img_listener_src: (B, 3, H, W)  Listener identity/source frame.
-            img_listener_tgt: (B, 3, H, W)  Ground-truth listener target frame.
+            img_speaker:      (B, T, C, H, W) Speaker video frames.
+            img_listener_src: (B, C, H, W)    Listener identity/source frame.
+            img_listener_tgt: (B, T, C, H, W) Ground-truth listener target frames.
             kl_weight:        Current KL loss weight (supports warmup schedule).
-            mel_listener_tgt: (B, audio_dim) Ground-truth listener mel features.
+            mel_listener_tgt: (B, T, audio_dim) Ground-truth listener mel features.
                               If None, mel reconstruction loss is skipped.
 
         Returns:
@@ -204,65 +226,79 @@ class TrainerListener(nn.Module):
         """
         self.gen.train()
         self.gen.zero_grad()
-
         _requires_grad(self._raw_gen.listener_bank, True)
         _requires_grad(self._raw_dis, False)
 
-        img_recon, f_pose, f_exp, alpha_D_pose, alpha_D_exp, _, mu_p, logvar_p, mu_e, logvar_e, audio_mel, mu_a, logvar_a = \
+        B, T, C, H, W = img_listener_tgt.shape
+
+        # Forward — all outputs carry the T dimension.
+        img_recon, f_pose, f_exp, alpha_D_pose, alpha_D_exp, _, \
+            mu_p, logvar_p, mu_e, logvar_e, audio_mel, mu_a, logvar_a = \
             self._raw_gen.forward_listener(
                 img_speaker, img_listener_src,
                 mode=self.training_mode,
                 training=True,
                 listener_mel=mel_listener_tgt,
             )
+        # img_recon:    (B, T, C, H, W)
+        # alpha_D_pose: (B, T, pose_dim)
+        # alpha_D_exp:  (B, T, exp_dim)
 
-        # GT bank: motion delta (src→tgt 변화량) — alpha_D_pose는 offset이므로 delta와 비교
+        # GT bank coefficients — encode src once, tgt for all T frames in one pass.
         with torch.no_grad():
+            # src: single identity frame — (B, C, H, W)
             wa_src, _, _, _ = self._raw_gen.enc(img_listener_src, None)
             shared_src = self._raw_gen.fc(wa_src)
-            alpha_D_pose_src = self._raw_gen.pose_fc(shared_src)  # (B, 6)
-            alpha_D_exp_src  = self._raw_gen.exp_fc(shared_src)   # (B, 10)
+            alpha_D_pose_src = self._raw_gen.pose_fc(shared_src)  # (B, pose_dim)
+            alpha_D_exp_src = self._raw_gen.exp_fc(shared_src)  # (B, exp_dim)
 
-            wa_tgt, _, _, _ = self._raw_gen.enc(img_listener_tgt, None)
+            # tgt: all T frames encoded in one batched pass — (B*T, C, H, W)
+            tgt_flat = img_listener_tgt.view(B * T, C, H, W)
+            wa_tgt, _, _, _ = self._raw_gen.enc(tgt_flat, None)
             shared_tgt = self._raw_gen.fc(wa_tgt)
-            alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt)  # (B, 6)
-            alpha_D_exp_tgt  = self._raw_gen.exp_fc(shared_tgt)   # (B, 10)
+            alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt).view(B, T, -1)  # (B, T, pose_dim)
+            alpha_D_exp_tgt = self._raw_gen.exp_fc(shared_tgt).view(B, T, -1)  # (B, T, exp_dim)
 
-            delta_pose = alpha_D_pose_tgt - alpha_D_pose_src  # 실제 pose 변화량
-            delta_exp  = alpha_D_exp_tgt  - alpha_D_exp_src   # 실제 exp 변화량
+            # Delta: broadcast src (B, dim) against tgt (B, T, dim).
+            delta_pose = alpha_D_pose_tgt - alpha_D_pose_src.unsqueeze(1)  # (B, T, pose_dim)
+            delta_exp = alpha_D_exp_tgt - alpha_D_exp_src.unsqueeze(1)  # (B, T, exp_dim)
 
-        adv_pred = self.dis(img_recon)
-        vgg_loss = self.criterion_vgg(img_recon, img_listener_tgt).mean()
-        l1_loss  = F.l1_loss(img_recon, img_listener_tgt)
+        # Discriminator and image losses — flatten T into batch for 2-D operations.
+        img_recon_flat = img_recon.view(B * T, C, H, W)
+        img_tgt_flat = img_listener_tgt.view(B * T, C, H, W)
+
+        adv_pred = self.dis(img_recon_flat)
+        vgg_loss = self.criterion_vgg(img_recon_flat, img_tgt_flat).mean()
+        l1_loss = F.l1_loss(img_recon_flat, img_tgt_flat)
         adv_loss = F.softplus(-adv_pred).mean()
 
-        # Bank loss: 예측된 pose/exp 변화량 vs 실제 리스너 pose/exp 변화량
-        bank_loss = (
-            F.l1_loss(alpha_D_pose, delta_pose)
-            + F.l1_loss(alpha_D_exp,  delta_exp)
-        ) * self.lambda_bank
+        # Bank loss: predicted pose/exp delta vs ground-truth listener delta.
+        bank_loss = (self._bank_sequence_loss(alpha_D_pose, delta_pose)
+                     + self._bank_sequence_loss(alpha_D_exp, delta_exp)
+                    ) * self.lambda_bank
 
-        # KL loss — pose + exp + audio VAEs (active mode only)
+        # KL loss — pose + exp + audio VAEs (active mode only).
+        # mu_p / logvar_p are (B, T, latent_dim); _kl_loss reduces over all dims.
         kl_loss = torch.zeros(1, device=self.device)
         if mu_p is not None and kl_weight > 0.0:
             kl_loss = (
-                self._kl_loss(mu_p, logvar_p)
-                + self._kl_loss(mu_e, logvar_e)
-                + self._kl_loss(mu_a, logvar_a)
-            ) * kl_weight
+                              self._kl_loss(mu_p, logvar_p)
+                              + self._kl_loss(mu_e, logvar_e)
+                              + self._kl_loss(mu_a, logvar_a)
+                      ) * kl_weight
 
-        # Mel reconstruction loss
+        # Mel reconstruction loss — both tensors are (B, T, audio_dim).
         mel_loss = torch.zeros(1, device=self.device)
         if audio_mel is not None and mel_listener_tgt is not None:
             mel_loss = F.l1_loss(audio_mel, mel_listener_tgt) * self.lambda_mel
 
         g_loss = (
-            self.lambda_vgg * vgg_loss
-            + self.lambda_l1  * l1_loss
-            + self.lambda_adv * adv_loss
-            + kl_loss
-            + mel_loss
-            + bank_loss
+                self.lambda_vgg * vgg_loss
+                + self.lambda_l1 * l1_loss
+                + self.lambda_adv * adv_loss
+                + kl_loss
+                + mel_loss
+                + bank_loss
         )
         g_loss.backward()
         self.g_optim.step()
@@ -270,26 +306,29 @@ class TrainerListener(nn.Module):
         return vgg_loss, l1_loss, adv_loss, kl_loss, mel_loss, bank_loss, img_recon.detach()
 
     def dis_update(
-        self,
-        img_real: torch.Tensor,
-        img_recon: torch.Tensor,
+            self,
+            img_real: torch.Tensor,  # (B, T, C, H, W)
+            img_recon: torch.Tensor,  # (B, T, C, H, W)
     ):
-        """One discriminator step."""
+        """One discriminator step over a full utterance sequence."""
         self.dis.zero_grad()
-
         _requires_grad(self._raw_gen.listener_bank, False)
         _requires_grad(self._raw_dis, True)
 
-        real_pred = self.dis(img_real)
-        fake_pred = self.dis(img_recon.detach())
+        # Flatten T into batch — discriminator judges each frame independently.
+        B, T, C, H, W = img_real.shape
+        real_flat = img_real.view(B * T, C, H, W)
+        fake_flat = img_recon.detach().view(B * T, C, H, W)
+
+        real_pred = self.dis(real_flat)
+        fake_pred = self.dis(fake_flat)
 
         d_loss = (
-            F.softplus(-real_pred).mean()
-            + F.softplus(fake_pred).mean()
+                F.softplus(-real_pred).mean()
+                + F.softplus(fake_pred).mean()
         )
         d_loss.backward()
         self.d_optim.step()
-
         return d_loss
 
     @torch.no_grad()

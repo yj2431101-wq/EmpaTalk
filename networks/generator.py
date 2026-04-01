@@ -162,6 +162,19 @@ class Generator(nn.Module):
             mirror_alpha_e=mirror_alpha_e,
         )
 
+        # Temporal GRU — applied after bank retrieval, before coefficient decoding.
+        # hidden_size matches style_dim so pose_fc / exp_fc input dims stay unchanged.
+        self.temporal_gru_pose = nn.GRU(
+            input_size=style_dim,
+            hidden_size=style_dim,
+            batch_first=True,
+        )
+        self.temporal_gru_exp = nn.GRU(
+            input_size=style_dim,
+            hidden_size=style_dim,
+            batch_first=True,
+        )
+
 
     def test_EDTalk_V(self, img_source, lip_img_drive, pose_img_drive, exp_img_drive, h_start=None):
 
@@ -271,7 +284,7 @@ class Generator(nn.Module):
         directions_D_S = torch.sum(shared_out, dim=1)              # (B, 512)
         return wa_S + directions_D_S, wa_S, f_pose_S, f_exp_S
 
-    def forward_listener(
+    def forward_listener_frame( # frame-wise
         self,
         img_speaker,
         img_listener,
@@ -372,3 +385,193 @@ class Generator(nn.Module):
         img_recon = self.dec(latent_poseD_L, feats_L, e_L)
 
         return img_recon, f_pose, f_exp, alpha_D_pose, alpha_D_exp, latent_poseD_S, mu_p, logvar_p, mu_e, logvar_e, audio_mel, mu_a, logvar_a
+
+    def forward_listener( # dialogue-wise
+        self,
+        img_speaker,          # (B, T, C, H, W)
+        img_listener,         # (B, C, H, W)  — identity frame, fixed across T
+        h_start=None,
+        mode: str = 'active',
+        audio_lip_feat=None,  # (B, T, lip_dim)
+        training: bool = True,
+        listener_mel=None,    # (B, T, N_MELS)
+    ):
+        """Generate an empathetic listener response over a sequence of speaker frames.
+
+        Extends the single-frame ``forward_listener`` to operate over T frames at once.
+        The listener identity (``img_listener``) is encoded once and shared across all
+        timesteps.  Speaker frames are encoded in a single batched pass by reshaping to
+        (B*T, ...) before the frozen encoder, then temporal context is introduced through
+        a lightweight GRU applied to the bank output features before coefficient decoding.
+
+        Args:
+            img_speaker:     (B, T, C, H, W) speaker frames for each timestep.
+            img_listener:    (B, C, H, W)    listener identity image (source), fixed.
+            h_start:         Optional starting hidden state for the listener encoder.
+            mode:            ``'passive'`` or ``'active'``.
+            audio_lip_feat:  (B, T, lip_dim) lip coefficients from Audio2Lip.
+            training:        Controls VAE reparameterization vs mean-only.
+            listener_mel:    (B, T, N_MELS) ground-truth listener mel for audio VAE.
+
+        Returns:
+            img_recon:      (B, T, C, H, W) generated listener frames.
+            f_pose:         (B, T, hidden_dim) temporally-contextualised pose features.
+            f_exp:          (B, T, hidden_dim) temporally-contextualised exp  features.
+            alpha_D_pose:   (B, T, pose_dim) pose motion coefficients.
+            alpha_D_exp:    (B, T, exp_dim)  expression motion coefficients.
+            latent_poseD_S: (B, T, style_dim) speaker pre-decoder latent.
+            mu_p / logvar_p (B, T, latent_dim) pose VAE params,  or None in passive mode.
+            mu_e / logvar_e (B, T, latent_dim) exp  VAE params,  or None in passive mode.
+            mu_a / logvar_a (B, T, latent_dim) audio VAE params, or None in passive mode.
+            audio_mel:      (B, T, mel_dim)  reconstructed mel,  or None.
+        """
+        B, T, C, H, W = img_speaker.shape
+        device = img_speaker.device
+
+        # ------------------------------------------------------------------
+        # 1. Listener identity — encode once; appearance features are reused
+        #    at every timestep via expand, avoiding redundant forward passes.
+        # ------------------------------------------------------------------
+        wa_L, _, feats_L, _ = self.enc(img_listener, None, h_start)
+        # wa_L:    (B, 512)
+        # feats_L: list[(B, C_i, H_i, W_i)]  — skip-connection tensors for dec()
+
+        # ------------------------------------------------------------------
+        # 2. Speaker — encode all T frames in one batched forward pass
+        #    by merging the time axis into the batch axis.
+        # ------------------------------------------------------------------
+        spk_flat = img_speaker.view(B * T, C, H, W)
+        latent_poseD_S_flat, wa_S_flat, f_pose_S_flat, f_exp_S_flat = \
+            self._speaker_latent(spk_flat)
+        # all: (B*T, feat_dim)
+
+        # ------------------------------------------------------------------
+        # 3. Bank retrieval — same interface as single-frame forward_listener;
+        #    inputs are (B*T, ...) so the bank processes every frame atomically.
+        # ------------------------------------------------------------------
+        mu_p = mu_e = logvar_p = logvar_e = None
+        mu_a = logvar_a = audio_mel = None
+
+        if mode == 'passive':
+            f_pose_flat, f_exp_flat = self.listener_bank.forward_passive(
+                latent_poseD_S_flat, f_pose_S_flat, f_exp_S_flat
+            )
+            # f_pose_flat, f_exp_flat: (B*T, style_dim)
+
+        else:  # active
+            # Replicate listener identity context across all T timesteps so that
+            # the VAE conditions on a consistent identity throughout the sequence.
+            wa_L_flat = wa_L.unsqueeze(1).expand(B, T, -1).reshape(B * T, -1)
+            # (B*T, 512)
+
+            mel_flat = (
+                listener_mel.view(B * T, -1)
+                if listener_mel is not None else None
+            )
+
+            (f_pose_flat, f_exp_flat, audio_mel_flat,
+             mu_p_flat, logvar_p_flat,
+             mu_e_flat, logvar_e_flat,
+             mu_a_flat, logvar_a_flat) = \
+                self.listener_bank.forward_active(
+                    latent_poseD_S_flat,
+                    wa_S=wa_L_flat,
+                    training=training,
+                    listener_mel=mel_flat,
+                )
+            # Reshape VAE params so KL loss can average over both B and T.
+            mu_p     = mu_p_flat.view(B, T, -1)
+            logvar_p = logvar_p_flat.view(B, T, -1)
+            mu_e     = mu_e_flat.view(B, T, -1)
+            logvar_e = logvar_e_flat.view(B, T, -1)
+            if mu_a_flat is not None:
+                mu_a      = mu_a_flat.view(B, T, -1)
+                logvar_a  = logvar_a_flat.view(B, T, -1)
+                audio_mel = audio_mel_flat.view(B, T, -1)
+
+        # ------------------------------------------------------------------
+        # 4. Temporal modelling — a lightweight GRU propagates context from
+        #    t=0 → t=T-1 so that each frame's coefficients depend on the
+        #    reaction history, not just the instantaneous speaker frame.
+        # ------------------------------------------------------------------
+        f_pose_seq = f_pose_flat.view(B, T, -1)   # (B, T, style_dim)
+        f_exp_seq  = f_exp_flat.view(B, T, -1)    # (B, T, style_dim)
+
+        f_pose_temporal, _ = self.temporal_gru_pose(f_pose_seq)
+        # (B, T, hidden_dim): hidden state at t carries pose context from 0..t-1
+        f_exp_temporal, _  = self.temporal_gru_exp(f_exp_seq)
+        # (B, T, hidden_dim)
+
+        # ------------------------------------------------------------------
+        # 5. Coefficient decoding — project temporally-enriched features to
+        #    the W-space motion coefficients used by direction_exp.
+        # ------------------------------------------------------------------
+        alpha_D_pose = self.pose_fc(
+            f_pose_temporal.reshape(B * T, -1)
+        ).view(B, T, -1)   # (B, T, pose_dim)
+
+        alpha_D_exp = self.exp_fc(
+            f_exp_temporal.reshape(B * T, -1)
+        ).view(B, T, -1)   # (B, T, exp_dim)
+
+        # ------------------------------------------------------------------
+        # 6. Lip coefficients — use audio-derived features when available,
+        #    otherwise keep the mouth closed (zero vector) for every frame.
+        # ------------------------------------------------------------------
+        alpha_D_lip = (
+            audio_lip_feat
+            if audio_lip_feat is not None
+            else torch.zeros(B, T, self.lip_dim, device=device)
+        )   # (B, T, lip_dim)
+
+        # ------------------------------------------------------------------
+        # 7. Direction mapping — concatenate all three coefficient types and
+        #    run through the shared direction network in one batched pass.
+        # ------------------------------------------------------------------
+        alpha_D_L_flat = torch.cat([
+            alpha_D_lip.reshape(B * T, -1),
+            alpha_D_pose.reshape(B * T, -1),
+            alpha_D_exp.reshape(B * T, -1),
+        ], dim=-1)
+        # (B*T, lip_dim + pose_dim + exp_dim)
+
+        a_L_flat           = self.direction_exp.get_shared_out(
+            alpha_D_L_flat, self.direction_lipnonlip.weight
+        )
+        e_L_flat           = self.direction_exp.get_exp_latent(a_L_flat)
+        directions_D_L_flat = self.direction_exp(
+            alpha_D_L_flat, self.direction_lipnonlip.weight
+        )
+        # all: (B*T, style_dim)
+
+        # ------------------------------------------------------------------
+        # 8. Latent composition — add listener motion directions onto the
+        #    listener identity latent (identical to the single-frame path):
+        #      latent_poseD_L = wa_L + directions_D_L
+        # ------------------------------------------------------------------
+        wa_L_flat      = wa_L.unsqueeze(1).expand(B, T, -1).reshape(B * T, -1)
+        latent_poseD_L = wa_L_flat + directions_D_L_flat   # (B*T, style_dim)
+
+        # ------------------------------------------------------------------
+        # 9. Decode — expand skip-connection feature maps along T and decode
+        #    all frames in a single call to the generator.
+        # ------------------------------------------------------------------
+        feats_L_exp = [
+            f.unsqueeze(1)
+             .expand(B, T, *f.shape[1:])
+             .reshape(B * T, *f.shape[1:])
+            for f in feats_L
+        ]
+
+        img_recon_flat = self.dec(latent_poseD_L, feats_L_exp, e_L_flat)
+        # (B*T, 3, H, W)
+
+        img_recon      = img_recon_flat.view(B, T, C, H, W)
+        latent_poseD_S = latent_poseD_S_flat.view(B, T, -1)
+
+        return (
+            img_recon, f_pose_temporal, f_exp_temporal,
+            alpha_D_pose, alpha_D_exp, latent_poseD_S,
+            mu_p, logvar_p, mu_e, logvar_e,
+            audio_mel, mu_a, logvar_a,
+        )

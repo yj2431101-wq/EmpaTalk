@@ -354,7 +354,7 @@ class ListenerBank(nn.Module):
         # otherwise fall back to learnable banks.
         if listener_mel is not None:
             mel_feat = self.mel_proj(listener_mel)  # (B, D)
-            f_pose_L, _ = self._attend_audio(self.pose_q, self.pose_k, self.pose_v, mel_feat, latent_poseD_S)
+            f_pose_L, _ = self._attend_audio(self.pose_q, self.pose_k, self.pose_v, mel_feat, latent_poseD_S) #하나의 attention에서 둘 다??
             f_exp_L,  _ = self._attend_audio(self.exp_q,  self.exp_k,  self.exp_v,  mel_feat, latent_poseD_S)
         else:
             f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)

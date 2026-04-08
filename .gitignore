@@ -1,0 +1,11 @@
+
+ckpts/
+listener_exp/
+.venv/
+venv/
+__pycache__/
+*.pth
+*.ckpt
+*.zip
+*.tar.gz
+data/

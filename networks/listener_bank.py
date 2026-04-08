@@ -238,7 +238,7 @@ class ListenerBank(nn.Module):
         vae_ctx = wa_S if wa_S is not None else latent_poseD_S
 
         if listener_mel is not None:
-            mel_feat = self.mel_proj(listener_mel)  # (B, D)
+            mel_feat = self.mel_proj(listener_mel.float())  # (B, D)
             f_pose_L, _ = self._attend_audio(self.pose_q, self.pose_k, self.pose_v, mel_feat, latent_poseD_S)
             f_exp_L,  _ = self._attend_audio(self.exp_q,  self.exp_k,  self.exp_v,  mel_feat, latent_poseD_S)
         else:

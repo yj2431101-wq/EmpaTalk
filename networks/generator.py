@@ -442,7 +442,9 @@ class Generator(nn.Module):
         f_exp_seq  = f_exp_flat.view(B, T, -1)    # (B, T, style_dim)
 
         f_pose_temporal, _ = self.temporal_gru_pose(f_pose_seq)
+        f_pose_temporal = 0.5*f_pose_temporal + 0.5*f_pose_seq # skip connection
         f_exp_temporal, _  = self.temporal_gru_exp(f_exp_seq)
+        f_exp_temporal = 0.5*f_exp_temporal + 0.5*f_exp_seq # skip connection
 
         # ------------------------------------------------------------------
         # 5. Coefficient decoding -- project temporally-enriched features to

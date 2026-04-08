@@ -114,6 +114,7 @@ class TrainerListener(nn.Module):
         self.lambda_l1         = getattr(args, "lambda_l1",         1.0)
         self.lambda_adv        = getattr(args, "lambda_adv",        0.1)
         self.lambda_bank       = getattr(args, "lambda_bank",       5.0)
+        self.lambda_bank_tgt   = getattr(args, "lambda_bank_tgt",   1.5) # bank tgt scale-up
         self.lambda_motion_amp = getattr(args, "lambda_motion_amp", 2.0)
 
         # Bank prototype initialization (K-means from training data)
@@ -286,8 +287,8 @@ class TrainerListener(nn.Module):
         adv_loss = F.softplus(-adv_pred).mean()
 
         # Bank loss
-        bank_loss = (self._bank_sequence_loss(alpha_D_pose, alpha_D_pose_tgt)
-                     + self._bank_sequence_loss(alpha_D_exp, alpha_D_exp_tgt)
+        bank_loss = (self._bank_sequence_loss(alpha_D_pose, alpha_D_pose_tgt*self.lambda_bank_tgt)
+                     + self._bank_sequence_loss(alpha_D_exp, alpha_D_exp_tgt*self.lambda_bank_tgt)
                     ) * self.lambda_bank
 
         # KL loss -- pose + exp VAEs only (active mode).

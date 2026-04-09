@@ -114,53 +114,61 @@ def _read_frame(cap: cv2.VideoCapture, frame_idx: int, size: int) -> torch.Tenso
     return tensor
 
 
-def _read_frames_uniform(cap: cv2.VideoCapture, size: int, total: int, T: int):
-    """Read the full video and uniformly sample T frames to cover the entire utterance.
-
-    This preserves the full temporal context (beginning, middle, end) of the
-    speaker's utterance while fitting within the T-frame memory budget.
-
-    Returns:
-        (T, C, H, W) tensor.
-    """
-    # Compute which frames to sample (evenly spaced)
+def _read_frames_uniform(cap, size, total, T):
     if total <= T:
         indices = list(range(total))
     else:
         indices = [int(i * total / T) for i in range(T)]
 
-    frames = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    index_set = set(indices)
+    frames_dict = {}
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    for i in range(total):
         ok, bgr = cap.read()
         if not ok:
             break
+
+        if i not in index_set:
+            continue
+
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        tensor = (tensor - 0.5) / 0.5
-        frames.append(tensor)
-    return torch.stack(frames) if frames else torch.zeros(0, 3, size, size)
+        rgb = cv2.resize(rgb, (size, size))
+
+        tensor = torch.from_numpy(rgb).permute(2,0,1).float().div_(255)
+        tensor = tensor.sub_(0.5).div_(0.5)
+
+        frames_dict[i] = tensor
+
+    frames = []
+    last = None
+    for idx in indices:
+        if idx in frames_dict:
+            last = frames_dict[idx]
+        frames.append(last if last is not None else torch.zeros(3,size,size))
+
+    return torch.stack(frames)
 
 
-def _read_all_frames(cap: cv2.VideoCapture, size: int, n_frames: int):
-    """Read up to n_frames sequentially from the beginning of the video.
-
-    Returns:
-        (T, C, H, W) tensor where T <= n_frames.
-    """
+def _read_video_all(cap, size):
     frames = []
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    for _ in range(n_frames):
+
+    while True:
         ok, bgr = cap.read()
         if not ok:
             break
+
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        tensor = (tensor - 0.5) / 0.5
+        rgb = cv2.resize(rgb, (size, size))
+
+        tensor = torch.from_numpy(rgb).permute(2,0,1).float().div_(255)
+        tensor = tensor.sub_(0.5).div_(0.5)
+
         frames.append(tensor)
-    return torch.stack(frames)  # (T, C, H, W)
+
+    return torch.stack(frames)  # (N, C, H, W)
 
 
 class AvaMERGDataset(Dataset):
@@ -369,45 +377,100 @@ class AvaMERGDataset(Dataset):
         n_spk = int(cap_spk.get(cv2.CAP_PROP_FRAME_COUNT))
         n_lis = int(cap_lis.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Fixed T for batch collation.
         T = self.max_frames if self.max_frames > 0 else min(n_spk, n_lis)
 
-        # Speaker: uniform sampling from FULL utterance → T frames.
-        # Preserves temporal context of the entire speaker utterance.
-        speaker_frames = _read_frames_uniform(cap_spk, self.size, n_spk, T)
+        # --------------------------------------------------
+        # ✅ 1. Uniform indices 미리 계산 (seek 없이 사용)
+        # --------------------------------------------------
+        spk_indices = np.linspace(0, max(0, n_spk - 1), T).astype(np.int32)
+        lis_indices = np.linspace(0, max(0, n_lis - 1), T).astype(np.int32)
 
-        # Listener GT: uniform sampling from FULL utterance → T frames.
-        # Paired with speaker — both cover their entire respective utterances.
-        listener_targets = _read_frames_uniform(cap_lis, self.size, n_lis, T)
-
-        # Listener identity: random frame from the listener video
-        gap = random.randint(self.identity_gap_min, self.identity_gap_max)
+        # listener identity index
         identity_idx = random.randint(0, max(0, n_lis - 1))
-        listener_source = _read_frame(cap_lis, identity_idx, self.size)
+
+        # --------------------------------------------------
+        # ✅ 2. Speaker sequential decode (1-pass)
+        # --------------------------------------------------
+        speaker_frames = []
+        spk_ptr = 0
+
+        for i in range(n_spk):
+            ret, frame = cap_spk.read()
+            if not ret:
+                break
+
+            if spk_ptr >= T:
+                break
+
+            if i == spk_indices[spk_ptr]:
+                frame = _process_frame(frame, self.size)  # resize + to tensor
+                speaker_frames.append(frame)
+                spk_ptr += 1
 
         cap_spk.release()
+
+        # --------------------------------------------------
+        # ✅ 3. Listener sequential decode (targets + source 동시에)
+        # --------------------------------------------------
+        listener_targets = []
+        listener_source = None
+        lis_ptr = 0
+
+        for i in range(n_lis):
+            ret, frame = cap_lis.read()
+            if not ret:
+                break
+
+            # target frames
+            if lis_ptr < T and i == lis_indices[lis_ptr]:
+                frame_t = _process_frame(frame, self.size)
+                listener_targets.append(frame_t)
+                lis_ptr += 1
+
+            # identity frame (한 번만)
+            if i == identity_idx:
+                listener_source = _process_frame(frame, self.size)
+
+            if lis_ptr >= T and listener_source is not None:
+                break
+
         cap_lis.release()
 
-        # Pad to fixed length T if video was shorter
-        if speaker_frames.shape[0] < T:
+        # --------------------------------------------------
+        # ✅ 4. stack
+        # --------------------------------------------------
+        speaker_frames = torch.stack(speaker_frames, dim=0) if len(speaker_frames) > 0 else torch.zeros(0)
+        listener_targets = torch.stack(listener_targets, dim=0) if len(listener_targets) > 0 else torch.zeros(0)
+
+        # --------------------------------------------------
+        # ✅ 5. padding (기존 유지)
+        # --------------------------------------------------
+        if speaker_frames.shape[0] < T and speaker_frames.shape[0] > 0:
             pad_n = T - speaker_frames.shape[0]
             speaker_frames = torch.cat(
                 [speaker_frames, speaker_frames[-1:].expand(pad_n, -1, -1, -1)], dim=0
             )
-        if listener_targets.shape[0] < T:
+
+        if listener_targets.shape[0] < T and listener_targets.shape[0] > 0:
             pad_n = T - listener_targets.shape[0]
             listener_targets = torch.cat(
                 [listener_targets, listener_targets[-1:].expand(pad_n, -1, -1, -1)], dim=0
             )
 
+        if listener_source is None:
+            listener_source = torch.zeros(3, self.size, self.size)
+
+        # --------------------------------------------------
+        # ✅ 6. mel (기존 유지)
+        # --------------------------------------------------
         speaker_mel = self._load_mel_sequence_interp(pair.get("spk_audio_path"), T)
         listener_mel = self._load_mel_sequence_interp(pair.get("lis_audio_path"), T)
 
         return {
-            "speaker_video":   speaker_frames,    # (T, C, H, W)
-            "listener_source": listener_source,    # (C, H, W)
-            "listener_target": listener_targets,   # (T, C, H, W)
-            "speaker_mel":     speaker_mel,        # (T, N_MELS)
-            "listener_mel":    listener_mel,       # (T, N_MELS)
+            "speaker_video": speaker_frames,
+            "listener_source": listener_source,
+            "listener_target": listener_targets,
+            "speaker_mel": speaker_mel,
+            "listener_mel": listener_mel,
             "pair_id": f"{pair['spk_id']}#{pair['lis_id']}@{identity_idx}",
         }

@@ -459,6 +459,8 @@ class TrainerListener(nn.Module):
         torch.save(
             {
                 "listener_bank": self._raw_gen.listener_bank.state_dict(),
+                "temp_gru_exp": self._raw_gen.temporal_gru_exp.state_dict(),
+                "temp_gru_pose": self._raw_gen.temporal_gru_pose.state_dict(),
                 "dis":           self._raw_dis.state_dict(),
                 "g_optim":       self.g_optim.state_dict(),
                 "d_optim":       self.d_optim.state_dict(),

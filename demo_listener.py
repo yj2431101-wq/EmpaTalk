@@ -154,18 +154,32 @@ def main():
     print("Initialising TrainerListener...")
     trainer = TrainerListener(args, device)
     missing, unexpected = trainer.gen.listener_bank.load_state_dict(
-        ckpt["listener_bank"], strict=False
-    )
+        ckpt["listener_bank"], strict=False)
     if missing:
-        print(f"  [WARN] missing keys (randomly init'd): {len(missing)}")
+        print(f"  [WARN] missing keys in listener_bank(randomly init'd): {len(missing)}")
     if unexpected:
-        print(f"  [WARN] unexpected keys: {unexpected}")
+        print(f"  [WARN] unexpected keys in listener_bank: {unexpected}")
+    missing, unexpected = trainer.gen.temporal_gru_exp.load_state_dict(
+        ckpt["temp_gru_exp"], strict=False)
+    if missing:
+        print(f"  [WARN] missing keys in temporal_gru_exp (randomly init'd): {len(missing)}")
+    if unexpected:
+        print(f"  [WARN] unexpected keys in temporal_gru_exp: {unexpected}")
+    missing, unexpected = trainer.gen.temporal_gru_pose.load_state_dict(
+        ckpt["temp_gru_pose"], strict=False)
+    if missing:
+        print(f"  [WARN] missing keys in temp_gru_pose (randomly init'd): {len(missing)}")
+    if unexpected:
+        print(f"  [WARN] unexpected keys in temp_gru_pose: {unexpected}")
+    print(f"  listener_bank & GRU loaded (step {ckpt.get('start_iter', '?')})")
+
     trainer.gen.eval()
-    print(f"  listener_bank loaded (step {ckpt.get('start_iter', '?')})")
 
     size = args.size
     gen = trainer._raw_gen
     lb = gen.listener_bank
+    gru_epx = gen.temporal_gru_exp
+    gru_pose = gen.temporal_gru_pose
 
     # -- 3. Load Audio2Lip (optional, for lip sync) --
     audio2lip = None
@@ -259,16 +273,21 @@ def main():
                     alpha_D_lip = torch.zeros(B, gen.lip_dim, device=device)
                 else:
                     # Active mode: use same mel_proj path as training
-                    f_pose, f_exp, audio_mel_pred, *_ = lb.forward_active(
-                        latent_poseD_S, wa_S=wa_L, training=False,
-                        listener_mel=frame_mel,
-                    )
+                    f_pose, f_exp, *_ =  lb.forward_active(
+                            latent_poseD_S, wa_S=wa_L, training=False,
+                            listener_mel=frame_mel,
+                        )
                     # Lip sync via Audio2Lip if available
                     if audio2lip is not None and a2l_mel_input is not None:
                         mel_window = a2l_mel_input[i:i+1]  # (1, 1, 80, 16)
                         alpha_D_lip = audio2lip(mel_window, 1, 1).squeeze(1)  # (1, 20)
                     else:
                         alpha_D_lip = torch.zeros(B, gen.lip_dim, device=device)
+                    # GPU process for bank output
+                    f_pose_temp, _ = gru_pose(f_pose)
+                    f_pose = 0.5 * f_pose_temp + 0.5 * f_pose  # skip connection
+                    f_exp_temp, _ = gru_exp(f_exp)
+                    f_exp = 0.5 * f_exp_temp + 0.5 * f_exp  # skip connection
 
                 alpha_D_pose = gen.pose_fc(f_pose) * cli.motion_scale
                 alpha_D_exp  = gen.exp_fc(f_exp)   * cli.motion_scale

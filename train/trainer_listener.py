@@ -42,10 +42,13 @@ def _requires_grad(net: nn.Module, flag: bool) -> None:
         p.requires_grad = flag
 
 
-def _listener_bank_params(gen: Generator):
+def _listener_bank_and_gru_params(gen: Generator):
     """Return only the ListenerBank parameters (including VAE heads)."""
-    return list(gen.listener_bank.parameters())
-
+    return (
+        list(gen.listener_bank.parameters())
+        + list(gen.temporal_gru_pose.parameters())
+        + list(gen.temporal_gru_exp.parameters())
+    )
 
 class TrainerListener(nn.Module):
     """Train only the ListenerBank (+ VAE heads) inside a pretrained Generator.
@@ -85,6 +88,8 @@ class TrainerListener(nn.Module):
         # Freeze everything, then unfreeze listener_bank (covers VAE too)
         _requires_grad(self.gen, False)
         _requires_grad(self.gen.listener_bank, True)
+        _requires_grad(self.gen.temporal_gru_pose, True)
+        _requires_grad(self.gen.temporal_gru_exp, True)
 
         # ------------------------------------------------------------------ #
         #  Discriminator (full, not frozen)                                   #
@@ -98,7 +103,7 @@ class TrainerListener(nn.Module):
         d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
 
         self.g_optim = optim.Adam(
-            _listener_bank_params(self.gen),
+            _listener_bank_and_gru_params(self.gen),
             lr=args.lr * g_reg_ratio,
             betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
         )
@@ -255,6 +260,8 @@ class TrainerListener(nn.Module):
         self.gen.train()
         self.gen.zero_grad()
         _requires_grad(self._raw_gen.listener_bank, True)
+        _requires_grad(self._raw_gen.temporal_gru_pose, True)
+        _requires_grad(self._raw_gen.temporal_gru_exp, True)
         _requires_grad(self._raw_dis, False)
 
         B, T, C, H, W = img_listener_tgt.shape
@@ -328,6 +335,8 @@ class TrainerListener(nn.Module):
         """One discriminator step over a full utterance sequence."""
         self.dis.zero_grad()
         _requires_grad(self._raw_gen.listener_bank, False)
+        _requires_grad(self._raw_gen.temporal_gru_pose, False)
+        _requires_grad(self._raw_gen.temporal_gru_exp, False)
         _requires_grad(self._raw_dis, True)
 
         # Flatten T into batch -- discriminator judges each frame independently.
@@ -478,6 +487,8 @@ class TrainerListener(nn.Module):
         missing, unexpected = self._raw_gen.listener_bank.load_state_dict(
             lb_state, strict=False
         )
+        self._raw_gen.temporal_gru_pose.load_state_dict(ckpt["temporal_gru_pose"])
+        self._raw_gen.temporal_gru_exp.load_state_dict(ckpt["temporal_gru_exp"])
         audio_missing  = [k for k in missing if "audio" in k]
         other_missing  = [k for k in missing if k not in audio_missing]
         if other_missing:

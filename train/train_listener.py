@@ -53,6 +53,60 @@ torch.backends.cudnn.benchmark = True
 
 # ---------------------------------------------------------------------------
 
+def log_parameter_status(trainer):
+    """Print a summary of which parameter groups are trainable vs frozen."""
+    raw_gen = trainer.gen.module if hasattr(trainer.gen, "module") else trainer.gen
+    raw_dis = trainer.dis.module if hasattr(trainer.dis, "module") else trainer.dis
+
+    header = "=" * 70
+    print(f"\n{header}")
+    print("  Parameter Freeze / Trainable Status")
+    print(header)
+
+    # -- Generator --
+    gen_groups = {}          # prefix -> (total, trainable)
+    for name, param in raw_gen.named_parameters():
+        prefix = name.split(".")[0]
+        total, trainable = gen_groups.get(prefix, (0, 0))
+        n = param.numel()
+        gen_groups[prefix] = (total + n, trainable + n * int(param.requires_grad))
+
+    print("\n[Generator]")
+    print(f"  {'Sub-module':<30s} {'Params':>12s}  {'Trainable':>12s}  Status")
+    print(f"  {'-' * 30}  {'-' * 12}  {'-' * 12}  {'-' * 10}")
+    gen_total = gen_trainable = 0
+    for prefix, (total, trainable) in sorted(gen_groups.items()):
+        gen_total += total
+        gen_trainable += trainable
+        if trainable == 0:
+            status = "FROZEN"
+        elif trainable == total:
+            status = "TRAIN"
+        else:
+            status = "PARTIAL"
+        print(f"  {prefix:<30s} {total:>12,}  {trainable:>12,}  {status}")
+    print(f"  {'(total)':<30s} {gen_total:>12,}  {gen_trainable:>12,}")
+
+    # -- Discriminator --
+    dis_total = sum(p.numel() for p in raw_dis.parameters())
+    dis_trainable = sum(p.numel() for p in raw_dis.parameters() if p.requires_grad)
+    print("\n[Discriminator]")
+    print(f"  Total params:     {dis_total:>12,}")
+    print(f"  Trainable params: {dis_trainable:>12,}  "
+          f"{'TRAIN' if dis_trainable > 0 else 'FROZEN'}")
+
+    # -- Overall --
+    all_total = gen_total + dis_total
+    all_trainable = gen_trainable + dis_trainable
+    print(f"\n[Overall]")
+    print(f"  Total params:     {all_total:>12,}")
+    print(f"  Trainable params: {all_trainable:>12,}  "
+          f"({all_trainable / max(all_total, 1) * 100:.1f}%)")
+    print(f"  Frozen params:    {all_total - all_trainable:>12,}  "
+          f"({(all_total - all_trainable) / max(all_total, 1) * 100:.1f}%)")
+    print(f"{header}\n")
+
+
 def save_loss_plot(history: dict, path: str):
     """Save 2x4 loss grid as PNG.  Called every iteration for live monitoring."""
     keys = ["vgg", "l1", "adv", "kl", "bank", "motion_amp", "dis"]
@@ -151,6 +205,9 @@ def main(args):
     if is_main:
         print("==> initialising TrainerListener")
     trainer = TrainerListener(args, device)
+
+    if is_main:
+        log_parameter_status(trainer)
 
     if args.distributed:
         from torch.nn.parallel import DistributedDataParallel as DDP

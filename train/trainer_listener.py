@@ -42,13 +42,13 @@ def _requires_grad(net: nn.Module, flag: bool) -> None:
         p.requires_grad = flag
 
 
-def _listener_bank_and_gru_params(gen: Generator):
-    """Return only the ListenerBank parameters (including VAE heads)."""
-    return (
-        list(gen.listener_bank.parameters())
-        + list(gen.temporal_gru_pose.parameters())
-        + list(gen.temporal_gru_exp.parameters())
-    )
+def _listener_bank_params(gen: Generator):
+    """Return ListenerBank + temporal GRU parameters (all trainable modules)."""
+    params = list(gen.listener_bank.parameters())
+    params += list(gen.temporal_gru_pose.parameters())
+    params += list(gen.temporal_gru_exp.parameters())
+    return params
+
 
 class TrainerListener(nn.Module):
     """Train only the ListenerBank (+ VAE heads) inside a pretrained Generator.
@@ -82,19 +82,23 @@ class TrainerListener(nn.Module):
             mirror_alpha_e=getattr(args, 'mirror_alpha_e', 0.3),
         ).to(device)
 
+        # ------------------------------------------------------------------ #
+        #  Discriminator -- created before _load_pretrained so its weights    #
+        #  can be restored from the checkpoint and frozen as a fixed critic.  #
+        # ------------------------------------------------------------------ #
+        self.dis = Discriminator(args.size, args.channel_multiplier).to(device)
+
         if args.pretrained_ckpt is not None:
             self._load_pretrained(args.pretrained_ckpt)
 
-        # Freeze everything, then unfreeze listener_bank (covers VAE too)
+        # Freeze everything, then unfreeze listener_bank + temporal GRUs
         _requires_grad(self.gen, False)
         _requires_grad(self.gen.listener_bank, True)
         _requires_grad(self.gen.temporal_gru_pose, True)
         _requires_grad(self.gen.temporal_gru_exp, True)
 
-        # ------------------------------------------------------------------ #
-        #  Discriminator (full, not frozen)                                   #
-        # ------------------------------------------------------------------ #
-        self.dis = Discriminator(args.size, args.channel_multiplier).to(device)
+        # Discriminator is used as a fixed critic (loaded from pretrained, frozen)
+        _requires_grad(self.dis, False)
 
         # ------------------------------------------------------------------ #
         #  Optimisers                                                          #
@@ -103,10 +107,11 @@ class TrainerListener(nn.Module):
         d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
 
         self.g_optim = optim.Adam(
-            _listener_bank_and_gru_params(self.gen),
+            _listener_bank_params(self.gen),
             lr=args.lr * g_reg_ratio,
             betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
         )
+        # d_optim kept for checkpoint compatibility, but unused (D is frozen)
         self.d_optim = optim.Adam(
             self.dis.parameters(),
             lr=args.lr * d_reg_ratio,
@@ -116,11 +121,15 @@ class TrainerListener(nn.Module):
         self.criterion_vgg = VGGLoss().to(device)
 
         self.lambda_vgg        = getattr(args, "lambda_vgg",        1.0)
-        self.lambda_l1         = getattr(args, "lambda_l1",         1.0)
-        self.lambda_adv        = getattr(args, "lambda_adv",        0.1)
+        self.lambda_l1         = getattr(args, "lambda_l1",         0.5)  # reduced: less mean-face regression
+        self.lambda_adv        = getattr(args, "lambda_adv",        0.3)  # increased: push for realistic motion
         self.lambda_bank       = getattr(args, "lambda_bank",       5.0)
-        self.lambda_bank_tgt   = getattr(args, "lambda_bank_tgt",   1.5) # bank tgt scale-up
-        self.lambda_motion_amp = getattr(args, "lambda_motion_amp", 2.0)
+        self.lambda_bank_tgt   = getattr(args, "lambda_bank_tgt",   2.0)  # increased: encourage larger coefficients
+        self.lambda_motion_amp = getattr(args, "lambda_motion_amp", 5.0)  # increased: penalise static faces
+
+        # Expression amplification: re-render GT with amplified expressions
+        # so reconstruction losses don't suppress expression intensity.
+        self.exp_amp_max = getattr(args, "exp_amp_max", 1.5)
 
         # Bank prototype initialization (K-means from training data)
         bank_init = getattr(args, "bank_init", None)
@@ -132,18 +141,20 @@ class TrainerListener(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _load_pretrained(self, ckpt_path: str) -> None:
-        """Load Generator weights from an EDTalk checkpoint.
+        """Load Generator + Discriminator weights from an EDTalk checkpoint.
 
         Keys that belong to listener_bank are skipped (randomly initialised)
-        so that only the pretrained backbone is restored.
+        so that only the pretrained backbone is restored.  The Discriminator
+        weights are also loaded when present so it can be used as a fixed
+        critic during listener training.
         """
-        print(f"Loading pretrained Generator from: {ckpt_path}")
+        print(f"Loading pretrained from: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        state = ckpt.get("gen", ckpt)  # support both wrapped and raw state dicts
+        gen_state = ckpt.get("gen", ckpt)  # support both wrapped and raw state dicts
 
-        # Filter out listener_bank keys -- they are newly added
+        # --- Generator --------------------------------------------------- #
         compatible = {
-            k: v for k, v in state.items()
+            k: v for k, v in gen_state.items()
             if not k.startswith("listener_bank")
         }
         missing, unexpected = self.gen.load_state_dict(compatible, strict=False)
@@ -155,6 +166,19 @@ class TrainerListener(nn.Module):
             print(f"  listener_bank keys (randomly init'd): {len(lb_missing)}")
         if unexpected:
             print(f"  [WARNING] Unexpected keys: {unexpected}")
+
+        # --- Discriminator (optional, used as fixed critic) -------------- #
+        if isinstance(ckpt, dict) and "dis" in ckpt:
+            try:
+                self.dis.load_state_dict(ckpt["dis"])
+                print("  Pretrained Discriminator loaded (will be frozen)")
+            except Exception as e:
+                print(f"  [WARNING] Failed to load Discriminator: {e}")
+                print("  [WARNING] D stays random -- consider --lambda_adv 0.0")
+        else:
+            print("  [WARNING] No 'dis' key in checkpoint -- D stays random.")
+            print("  [WARNING] Random frozen D gives noisy adv_loss. "
+                  "Consider --lambda_adv 0.0")
 
     # ------------------------------------------------------------------ #
     #  DDP-safe accessors                                                  #
@@ -234,6 +258,50 @@ class TrainerListener(nn.Module):
         return deficit.mean()
 
     # ------------------------------------------------------------------ #
+    #  Expression-amplified GT                                             #
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def _amplify_expression_targets(
+        self,
+        img_tgt_flat: torch.Tensor,
+        amp_scale: float,
+    ):
+        """Re-render GT listener frames with amplified expression coefficients.
+
+        Uses the frozen encoder+decoder to create GT images whose expression
+        intensity matches the amplified coefficient targets.  This eliminates
+        the conflict between reconstruction losses (which pull toward the
+        original small-expression GT) and coefficient losses (which push
+        toward larger expressions).
+
+        Args:
+            img_tgt_flat: (B*T, C, H, W) ground-truth listener frames.
+            amp_scale:    Expression amplification factor (1.0 = identity).
+
+        Returns:
+            img_amp:   (B*T, C, H, W) re-rendered GT with amplified expression.
+            alpha_pose: (B*T, pose_dim) pose coefficients (unchanged).
+            alpha_exp:  (B*T, exp_dim) amplified expression coefficients.
+        """
+        gen = self._raw_gen
+
+        wa, _, feats, _ = gen.enc(img_tgt_flat, None)
+        shared = gen.fc(wa)
+
+        alpha_lip  = gen.lip_fc(shared)
+        alpha_pose = gen.pose_fc(shared)
+        alpha_exp  = gen.exp_fc(shared) * amp_scale   # amplify expression only
+
+        alpha_D = torch.cat([alpha_lip, alpha_pose, alpha_exp], dim=-1)
+        a = gen.direction_exp.get_shared_out(alpha_D, gen.direction_lipnonlip.weight)
+        e = gen.direction_exp.get_exp_latent(a)
+        directions = gen.direction_exp(alpha_D, gen.direction_lipnonlip.weight)
+
+        img_amp = gen.dec(wa + directions, feats, e)
+        return img_amp, alpha_pose, alpha_exp
+
+    # ------------------------------------------------------------------ #
     #  Training steps                                                      #
     # ------------------------------------------------------------------ #
 
@@ -276,17 +344,27 @@ class TrainerListener(nn.Module):
                 listener_mel=mel_listener_tgt,
             )
 
-        # GT bank coefficients -- encode tgt for all T frames in one pass.
+        # GT bank coefficients + optional expression amplification.
+        # When exp_amp_max > 1.0, GT frames are re-rendered with amplified
+        # expressions so that image losses and coefficient losses are aligned.
         with torch.no_grad():
             tgt_flat = img_listener_tgt.view(B * T, C, H, W)
-            wa_tgt, _, _, _ = self._raw_gen.enc(tgt_flat, None)
-            shared_tgt = self._raw_gen.fc(wa_tgt)
-            alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt).view(B, T, -1)
-            alpha_D_exp_tgt = self._raw_gen.exp_fc(shared_tgt).view(B, T, -1)
+
+            if self.exp_amp_max > 1.0:
+                amp = 1.0 + torch.rand(1).item() * (self.exp_amp_max - 1.0)
+                img_tgt_flat, alpha_pose_flat, alpha_exp_flat = \
+                    self._amplify_expression_targets(tgt_flat, amp)
+                alpha_D_pose_tgt = alpha_pose_flat.view(B, T, -1)
+                alpha_D_exp_tgt  = alpha_exp_flat.view(B, T, -1)
+            else:
+                wa_tgt, _, _, _ = self._raw_gen.enc(tgt_flat, None)
+                shared_tgt = self._raw_gen.fc(wa_tgt)
+                alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt).view(B, T, -1)
+                alpha_D_exp_tgt  = self._raw_gen.exp_fc(shared_tgt).view(B, T, -1)
+                img_tgt_flat = tgt_flat
 
         # Image losses -- flatten T into batch.
         img_recon_flat = img_recon.view(B * T, C, H, W)
-        img_tgt_flat = img_listener_tgt.view(B * T, C, H, W)
 
         adv_pred = self.dis(img_recon_flat)
         vgg_loss = self.criterion_vgg(img_recon_flat, img_tgt_flat).mean()
@@ -332,28 +410,13 @@ class TrainerListener(nn.Module):
             img_real: torch.Tensor,  # (B, T, C, H, W)
             img_recon: torch.Tensor,  # (B, T, C, H, W)
     ):
-        """One discriminator step over a full utterance sequence."""
-        self.dis.zero_grad()
-        _requires_grad(self._raw_gen.listener_bank, False)
-        _requires_grad(self._raw_gen.temporal_gru_pose, False)
-        _requires_grad(self._raw_gen.temporal_gru_exp, False)
-        _requires_grad(self._raw_dis, True)
+        """Discriminator is frozen (fixed critic) -- no update performed.
 
-        # Flatten T into batch -- discriminator judges each frame independently.
-        B, T, C, H, W = img_real.shape
-        real_flat = img_real.view(B * T, C, H, W)
-        fake_flat = img_recon.detach().view(B * T, C, H, W)
-
-        real_pred = self.dis(real_flat)
-        fake_pred = self.dis(fake_flat)
-
-        d_loss = (
-                F.softplus(-real_pred).mean()
-                + F.softplus(fake_pred).mean()
-        )
-        d_loss.backward()
-        self.d_optim.step()
-        return d_loss
+        The pretrained Discriminator loaded from the EDTalk checkpoint acts
+        as a fixed realism critic whose gradients still flow to the generator
+        via adv_loss in gen_update, but whose own weights are never updated.
+        """
+        return torch.zeros(1, device=self.device)
 
     @torch.no_grad()
     def sample_prior(
@@ -487,8 +550,6 @@ class TrainerListener(nn.Module):
         missing, unexpected = self._raw_gen.listener_bank.load_state_dict(
             lb_state, strict=False
         )
-        self._raw_gen.temporal_gru_pose.load_state_dict(ckpt["temporal_gru_pose"])
-        self._raw_gen.temporal_gru_exp.load_state_dict(ckpt["temporal_gru_exp"])
         audio_missing  = [k for k in missing if "audio" in k]
         other_missing  = [k for k in missing if k not in audio_missing]
         if other_missing:
@@ -499,6 +560,14 @@ class TrainerListener(nn.Module):
             print(f"  [WARNING] Unexpected keys in ckpt: {unexpected}")
 
         self._raw_dis.load_state_dict(ckpt["dis"])
+
+        # Load temporal GRU states (critical for empathy temporal modelling)
+        if "temp_gru_pose" in ckpt:
+            self._raw_gen.temporal_gru_pose.load_state_dict(ckpt["temp_gru_pose"])
+            self._raw_gen.temporal_gru_exp.load_state_dict(ckpt["temp_gru_exp"])
+            print("  Temporal GRU states loaded")
+        else:
+            print("  [WARN] No GRU states in checkpoint (randomly init'd)")
 
         # Skip optimizer state if new parameters were added (incompatible param groups).
         if not audio_missing:

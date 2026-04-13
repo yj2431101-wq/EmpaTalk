@@ -1,9 +1,17 @@
 """
-Speaker video + Listener audio -> Listener reaction video generation
+Listener reaction inference ? T-matched coefficient interpolation.
 
-Supports two audio use-cases:
-  1. Listener audio only  -> pose/exp conditioning via mel_proj (same path as training)
-  2. Listener audio + Audio2Lip ckpt -> additionally drives lip sync
+Eliminates the train-inference gap by running the model at the same
+temporal resolution used during training (T_model), then interpolating
+motion coefficients to the original video frame count.
+
+Pipeline:
+    1. Uniform-sample speaker video ⊥ T_model frames  (same as training)
+    2. Interpolate listener mel     ⊥ T_model frames  (same as training)
+    3. forward_listener(T_model)    ⊥ pose/exp coefficients + GRU context
+    4. Interpolate coefficients     ⊥ n_frames (original video length)
+    5. Audio2Lip at n_frames        ⊥ lip coefficients (optional)
+    6. Chunked decode(n_frames)     ⊥ output video
 
 Usage:
     python demo_listener.py \
@@ -12,7 +20,6 @@ Usage:
         --speaker   /path/to/speaker.mp4 \
         --listener_ref /path/to/listener_ref.mp4 \
         --listener_audio /path/to/listener.wav \
-        --audio2lip_ckpt /path/to/Audio2Lip.pt \
         --out       ./listener_output.mp4
 """
 import argparse
@@ -37,6 +44,8 @@ _N_MELS  = 80
 _MEL_WIN = 16  # mel frames per video frame (Audio2Lip window)
 
 
+# 式式 helpers 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+
 def read_frame(cap, frame_idx, size):
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, bgr = cap.read()
@@ -45,17 +54,15 @@ def read_frame(cap, frame_idx, size):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
     t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-    t = (t - 0.5) / 0.5  # [-1, 1]
-    return t
+    return (t - 0.5) / 0.5  # [-1, 1]
 
 
 def tensor_to_bgr(t, size):
     """(3, H, W) in [-1, 1] -> (H, W, 3) uint8 BGR"""
-    img = (t.clamp(-1, 1) + 1) / 2  # [0, 1]
+    img = (t.clamp(-1, 1) + 1) / 2
     img = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    img = cv2.resize(img, (size, size))
-    return img
+    return cv2.resize(img, (size, size))
 
 
 def load_image_as_tensor(path, size):
@@ -63,16 +70,32 @@ def load_image_as_tensor(path, size):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
     t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-    t = (t - 0.5) / 0.5
-    return t
+    return (t - 0.5) / 0.5
 
 
-def load_mel_sequence(audio_path: str, n_frames: int) -> torch.Tensor:
-    """Load audio -> mel spectrogram, resample to n_frames via interpolation.
+def read_frames_uniform(cap, size, total, T):
+    """Uniform-sample T frames from the full video (same as training)."""
+    if total <= T:
+        indices = list(range(total))
+    else:
+        indices = [int(i * total / T) for i in range(T)]
+    frames = []
+    for idx in indices:
+        f = read_frame(cap, idx, size)
+        if f is not None:
+            frames.append(f)
+    if not frames:
+        return torch.zeros(0, 3, size, size)
+    out = torch.stack(frames)
+    # Pad if shorter than T
+    if out.shape[0] < T:
+        pad_n = T - out.shape[0]
+        out = torch.cat([out, out[-1:].expand(pad_n, -1, -1, -1)], dim=0)
+    return out
 
-    Returns:
-        (n_frames, N_MELS) float32 tensor.
-    """
+
+def load_mel_sequence(audio_path, n_frames):
+    """Load audio ⊥ mel, interpolate to n_frames. Returns (n_frames, N_MELS)."""
     wav = audio_utils.load_wav(audio_path, sr=_SR)
     mel = audio_utils.melspectrogram(wav)  # (N_MELS, T_mel)
     mel_t = torch.from_numpy(mel).unsqueeze(0)  # (1, N_MELS, T_mel)
@@ -82,17 +105,10 @@ def load_mel_sequence(audio_path: str, n_frames: int) -> torch.Tensor:
     return mel_resampled.squeeze(0).permute(1, 0)  # (n_frames, N_MELS)
 
 
-def load_mel_for_audio2lip(audio_path: str, n_frames: int) -> torch.Tensor:
-    """Load audio -> mel windows for Audio2Lip input.
-
-    Audio2Lip expects (B*T, 1, 80, 16) where 16 = mel window per video frame.
-
-    Returns:
-        (n_frames, 1, N_MELS, MEL_WIN) float32 tensor.
-    """
+def load_mel_for_audio2lip(audio_path, n_frames):
+    """Load audio ⊥ mel windows for Audio2Lip. Returns (n_frames, 1, 80, 16)."""
     wav = audio_utils.load_wav(audio_path, sr=_SR)
     mel = audio_utils.melspectrogram(wav)  # (N_MELS, T_mel)
-
     mel_windows = []
     for i in range(n_frames):
         mel_start = int(i * _SR / _FPS / _HOP)
@@ -105,83 +121,86 @@ def load_mel_for_audio2lip(audio_path: str, n_frames: int) -> torch.Tensor:
                 pad = _MEL_WIN - mel_slice.shape[1]
                 mel_slice = np.pad(mel_slice, ((0, 0), (0, pad)), mode="edge")
         mel_windows.append(mel_slice)
-
-    # (n_frames, N_MELS, MEL_WIN) -> (n_frames, 1, N_MELS, MEL_WIN)
     mel_windows = np.stack(mel_windows, axis=0).astype(np.float32)
     return torch.from_numpy(mel_windows).unsqueeze(1)
 
 
+def interp_coefficients(coeff, target_len):
+    """Interpolate (1, T, D) coefficients to (1, target_len, D)."""
+    # (1, T, D) ⊥ (1, D, T) ⊥ interpolate ⊥ (1, D, target_len) ⊥ (1, target_len, D)
+    return F.interpolate(
+        coeff.permute(0, 2, 1),
+        size=target_len,
+        mode='linear',
+        align_corners=False,
+    ).permute(0, 2, 1)
+
+
+# 式式 main 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Listener inference ? T-matched coefficient interpolation")
     parser.add_argument("--ckpt",         required=True, help="listener checkpoint .pt")
     parser.add_argument("--pretrained",   required=True, help="EDTalk pretrained .pt")
     parser.add_argument("--speaker",      required=True, help="speaker video or image path")
     parser.add_argument("--listener_ref", required=True, help="listener reference (video or image)")
     parser.add_argument("--listener_audio", default=None,
-                        help="Listener audio (.wav). Enables pose/exp conditioning via "
-                             "the same mel_proj path used during training (no train/test gap).")
+                        help="Listener audio (.wav). Enables pose/exp conditioning "
+                             "via mel_proj (same path as training).")
     parser.add_argument("--audio2lip_ckpt", default=None,
-                        help="Audio2Lip checkpoint (.pt). When combined with --listener_audio, "
-                             "also drives lip sync from listener audio.")
+                        help="Audio2Lip checkpoint (.pt). Drives lip sync at "
+                             "original frame rate (independent of T_model).")
     parser.add_argument("--out",          default="./listener_output.mp4")
     parser.add_argument("--device",       default="cuda:0")
     parser.add_argument("--n_frames",     type=int, default=60,
                         help="frames to generate when speaker is an image")
     parser.add_argument("--side_by_side", action="store_true",
                         help="save speaker|listener side-by-side")
-    parser.add_argument("--use_prior",    action="store_true",
-                        help="sample from VAE prior N(0,I) instead of posterior")
     parser.add_argument("--motion_scale", type=float, default=1.0,
                         help="motion coefficient scale (>1 amplifies movement)")
-    parser.add_argument("--smooth",       type=float, default=0.0,
-                        help="temporal smoothing (0=none, 0.5~0.8 recommended)")
-    parser.add_argument("--z_momentum",   type=float, default=0.9,
-                        help="prior z temporal continuity (0=independent, 0.9=smooth)")
+    parser.add_argument("--decode_chunk", type=int, default=32,
+                        help="frames per decode batch (reduce if OOM)")
     parser.add_argument("--debug",        action="store_true")
     cli = parser.parse_args()
 
     device = torch.device(cli.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # -- 1. Load checkpoint --
+    # 式式 1. Load checkpoint 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
     print(f"Loading checkpoint: {cli.ckpt}")
     ckpt = torch.load(cli.ckpt, map_location=device, weights_only=False)
     args = ckpt["args"]
     args.pretrained_ckpt = cli.pretrained
     args.resume_ckpt = None
 
-    # -- 2. Init Trainer --
+    T_MODEL = getattr(args, 'max_frames', 16)
+    print(f"T_model (from training): {T_MODEL}")
+
+    # 式式 2. Init Trainer 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
     print("Initialising TrainerListener...")
     trainer = TrainerListener(args, device)
-    missing, unexpected = trainer.gen.listener_bank.load_state_dict(
+
+    # Load listener_bank + GRU states
+    missing, _ = trainer.gen.listener_bank.load_state_dict(
         ckpt["listener_bank"], strict=False)
     if missing:
-        print(f"  [WARN] missing keys in listener_bank(randomly init'd): {len(missing)}")
-    if unexpected:
-        print(f"  [WARN] unexpected keys in listener_bank: {unexpected}")
-    missing, unexpected = trainer.gen.temporal_gru_exp.load_state_dict(
-        ckpt["temp_gru_exp"], strict=False)
-    if missing:
-        print(f"  [WARN] missing keys in temporal_gru_exp (randomly init'd): {len(missing)}")
-    if unexpected:
-        print(f"  [WARN] unexpected keys in temporal_gru_exp: {unexpected}")
-    missing, unexpected = trainer.gen.temporal_gru_pose.load_state_dict(
-        ckpt["temp_gru_pose"], strict=False)
-    if missing:
-        print(f"  [WARN] missing keys in temp_gru_pose (randomly init'd): {len(missing)}")
-    if unexpected:
-        print(f"  [WARN] unexpected keys in temp_gru_pose: {unexpected}")
-    print(f"  listener_bank & GRU loaded (step {ckpt.get('start_iter', '?')})")
+        print(f"  [WARN] missing keys in listener_bank: {len(missing)}")
 
+    if "temp_gru_pose" in ckpt:
+        trainer.gen.temporal_gru_pose.load_state_dict(ckpt["temp_gru_pose"])
+        trainer.gen.temporal_gru_exp.load_state_dict(ckpt["temp_gru_exp"])
+        print("  listener_bank + GRU loaded")
+    else:
+        print("  [WARN] No GRU states in checkpoint")
+
+    print(f"  Step: {ckpt.get('start_iter', '?')}")
     trainer.gen.eval()
 
     size = args.size
     gen = trainer._raw_gen
-    lb = gen.listener_bank
-    gru_epx = gen.temporal_gru_exp
-    gru_pose = gen.temporal_gru_pose
 
-    # -- 3. Load Audio2Lip (optional, for lip sync) --
+    # 式式 3. Load Audio2Lip (optional, for lip sync) 式式式式式式式式式式式式式式式式式式式式式式
     audio2lip = None
     if cli.audio2lip_ckpt is not None and cli.listener_audio is not None:
         from networks.audio_encoder import Audio2Lip
@@ -193,14 +212,14 @@ def main():
             p.requires_grad = False
         print(f"  Audio2Lip loaded from {cli.audio2lip_ckpt}")
 
-    # -- 4. Load speaker input --
+    # 式式 4. Load speaker input 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
     spk_ext = os.path.splitext(cli.speaker)[1].lower()
     if spk_ext in (".jpg", ".jpeg", ".png", ".bmp"):
         spk_static = load_image_as_tensor(cli.speaker, size).to(device)
         cap_spk = None
         n_frames = cli.n_frames
         fps = 25.0
-        print(f"Speaker: image -> {n_frames} frames")
+        print(f"Speaker: image ⊥ {n_frames} frames")
     else:
         spk_static = None
         cap_spk = cv2.VideoCapture(cli.speaker)
@@ -208,128 +227,156 @@ def main():
         fps = cap_spk.get(cv2.CAP_PROP_FPS) or 25.0
         print(f"Speaker video: {n_frames} frames @ {fps:.1f} fps")
 
-    # -- 5. Load listener reference --
+    # 式式 5. Load listener reference 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
     ext = os.path.splitext(cli.listener_ref)[1].lower()
     if ext in (".jpg", ".jpeg", ".png", ".bmp"):
         listener_src = load_image_as_tensor(cli.listener_ref, size).to(device)
         cap_lis = None
-        print(f"Listener ref: image ({cli.listener_ref})")
     else:
         cap_lis = cv2.VideoCapture(cli.listener_ref)
         listener_src = read_frame(cap_lis, 0, size).to(device)
-        print(f"Listener ref: video first frame ({cli.listener_ref})")
+    print(f"Listener ref: {cli.listener_ref}")
 
-    # -- 6. Load listener audio mel (optional) --
-    mel_seq = None        # (n_frames, N_MELS) for pose/exp conditioning
-    a2l_mel_input = None  # (n_frames, 1, N_MELS, MEL_WIN) for Audio2Lip
+    # 式式 6. Prepare T_model inputs (matching training distribution) 式式式式式式
+    print(f"\n[Step 1] Preparing T_model={T_MODEL} inputs...")
+
+    # Speaker: uniform sample ⊥ T_MODEL frames (same as dataset)
+    if spk_static is not None:
+        spk_T = spk_static.unsqueeze(0).expand(T_MODEL, -1, -1, -1)
+    else:
+        spk_T = read_frames_uniform(cap_spk, size, n_frames, T_MODEL).to(device)
+    spk_batch = spk_T.unsqueeze(0)  # (1, T_MODEL, C, H, W)
+    print(f"  Speaker: (1, {T_MODEL}, 3, {size}, {size})")
+
+    # Listener identity
+    lis_batch = listener_src.unsqueeze(0)  # (1, C, H, W)
+
+    # Listener mel at T_MODEL (same as dataset's _load_mel_sequence_interp)
+    mel_batch = None
     if cli.listener_audio is not None:
-        print(f"Loading listener audio: {cli.listener_audio}")
-        mel_seq = load_mel_sequence(cli.listener_audio, n_frames).to(device)
-        print(f"  mel_seq shape: {mel_seq.shape}")
-        if audio2lip is not None:
-            a2l_mel_input = load_mel_for_audio2lip(cli.listener_audio, n_frames).to(device)
-            print(f"  audio2lip mel shape: {a2l_mel_input.shape}")
+        mel_T = load_mel_sequence(cli.listener_audio, T_MODEL).to(device)
+        mel_batch = mel_T.unsqueeze(0)  # (1, T_MODEL, 80)
+        print(f"  Listener mel: (1, {T_MODEL}, 80)")
+    else:
+        print(f"  Listener mel: None (no audio provided)")
 
-    # -- 7. Output video writer --
+    # 式式 7. forward_listener at T_MODEL 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+    print(f"\n[Step 2] Running forward_listener at T_model={T_MODEL}...")
+    with torch.no_grad():
+        (img_recon_T,  # (1, T_MODEL, C, H, W) ? discarded
+         f_pose, f_exp,
+         alpha_D_pose,  # (1, T_MODEL, pose_dim=6)
+         alpha_D_exp,   # (1, T_MODEL, exp_dim=10)
+         latent_poseD_S,
+         mu_p, logvar_p, mu_e, logvar_e,
+         ) = gen.forward_listener(
+            spk_batch, lis_batch,
+            mode=trainer.training_mode,
+            training=False,
+            listener_mel=mel_batch,
+        )
+
+    print(f"  alpha_D_pose: {alpha_D_pose.shape}, norm={alpha_D_pose.norm().item():.4f}")
+    print(f"  alpha_D_exp:  {alpha_D_exp.shape},  norm={alpha_D_exp.norm().item():.4f}")
+
+    # 式式 8. Interpolate coefficients to original frame count 式式式式式式式式式式式式式
+    print(f"\n[Step 3] Interpolating coefficients {T_MODEL} ⊥ {n_frames} frames...")
+    alpha_pose_full = interp_coefficients(alpha_D_pose, n_frames)  # (1, n_frames, 6)
+    alpha_exp_full  = interp_coefficients(alpha_D_exp,  n_frames)  # (1, n_frames, 10)
+    print(f"  alpha_pose_full: {alpha_pose_full.shape}")
+    print(f"  alpha_exp_full:  {alpha_exp_full.shape}")
+
+    # 式式 9. Audio2Lip at original frame rate (optional) 式式式式式式式式式式式式式式式式式式
+    if audio2lip is not None and cli.listener_audio is not None:
+        print(f"\n[Step 4] Audio2Lip at {n_frames} frames (original rate)...")
+        a2l_mel = load_mel_for_audio2lip(cli.listener_audio, n_frames).to(device)
+        with torch.no_grad():
+            alpha_lip_full = audio2lip(a2l_mel, 1, n_frames)  # (1, n_frames, 20)
+        print(f"  alpha_lip_full: {alpha_lip_full.shape}")
+    else:
+        alpha_lip_full = torch.zeros(1, n_frames, gen.lip_dim, device=device)
+
+    # 式式 10. Listener identity encoding (once) 式式式式式式式式式式式式式式式式式式式式式式式式式式式
+    with torch.no_grad():
+        wa_L, _, feats_L, _ = gen.enc(lis_batch, None, None)
+    # wa_L: (1, 512), feats_L: list of (1, C_i, H_i, W_i)
+
+    # 式式 11. Chunked decode 式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式式
+    CHUNK = cli.decode_chunk
     out_w = size * 2 if cli.side_by_side else size
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(cli.out, fourcc, fps, (out_w, size))
 
-    # -- 8. Frame-by-frame inference --
-    mode_str = "prior" if cli.use_prior else ("active+audio" if mel_seq is not None else "active")
-    print(f"Generating listener video ({mode_str})...")
-    prev_pred = None
-    z_pose = z_exp = None
+    # Prepare speaker frames for side-by-side (read at original fps)
+    spk_frames_for_display = None
+    if cli.side_by_side and cap_spk is not None:
+        cap_spk.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    for i in range(n_frames):
-        if spk_static is not None:
-            spk_t = spk_static.unsqueeze(0)
-        else:
-            spk_t = read_frame(cap_spk, i, size)
-            if spk_t is None:
-                break
-            spk_t = spk_t.unsqueeze(0).to(device)  # (1, 3, H, W)
-        lis_t = listener_src.unsqueeze(0)            # (1, 3, H, W)
+    print(f"\n[Step 5] Decoding {n_frames} frames (chunk={CHUNK})...")
+    frame_count = 0
+
+    for start in range(0, n_frames, CHUNK):
+        end = min(start + CHUNK, n_frames)
+        chunk_size = end - start
 
         with torch.no_grad():
-            if cli.use_prior:
-                pred, z_pose, z_exp = trainer.sample_prior(
-                    spk_t, lis_t,
-                    motion_scale=cli.motion_scale,
-                    z_pose=z_pose, z_exp=z_exp,
-                    z_momentum=cli.z_momentum,
-                )
-            else:
-                # Compute speaker latent
-                latent_poseD_S, wa_S, f_pose_S, f_exp_S = gen._speaker_latent(spk_t)
-                wa_L, _, feats_L, _ = gen.enc(lis_t, None, None)
-                B = 1
+            # Coefficients for this chunk
+            alpha_lip  = alpha_lip_full[0, start:end]       # (chunk, 20)
+            alpha_pose = alpha_pose_full[0, start:end] * cli.motion_scale  # (chunk, 6)
+            alpha_exp  = alpha_exp_full[0, start:end]  * cli.motion_scale  # (chunk, 10)
 
-                # Listener mel for this frame (pose/exp conditioning)
-                frame_mel = mel_seq[i:i+1] if mel_seq is not None else None  # (1, N_MELS) or None
+            # Direction mapping
+            alpha_D_L = torch.cat([alpha_lip, alpha_pose, alpha_exp], dim=-1)  # (chunk, 36)
+            a_L = gen.direction_exp.get_shared_out(
+                alpha_D_L, gen.direction_lipnonlip.weight)
+            e_L = gen.direction_exp.get_exp_latent(a_L)
+            directions_D_L = gen.direction_exp(
+                alpha_D_L, gen.direction_lipnonlip.weight)
 
-                if trainer.training_mode == 'passive':
-                    f_pose, f_exp = lb.forward_passive(latent_poseD_S, f_pose_S, f_exp_S)
-                    alpha_D_lip = torch.zeros(B, gen.lip_dim, device=device)
-                else:
-                    # Active mode: use same mel_proj path as training
-                    f_pose, f_exp, *_ =  lb.forward_active(
-                            latent_poseD_S, wa_S=wa_L, training=False,
-                            listener_mel=frame_mel,
-                        )
-                    # Lip sync via Audio2Lip if available
-                    if audio2lip is not None and a2l_mel_input is not None:
-                        mel_window = a2l_mel_input[i:i+1]  # (1, 1, 80, 16)
-                        alpha_D_lip = audio2lip(mel_window, 1, 1).squeeze(1)  # (1, 20)
+            # Expand listener identity to chunk_size
+            wa_L_exp = wa_L.expand(chunk_size, -1)  # (chunk, 512)
+            feats_L_exp = [f.expand(chunk_size, *f.shape[1:]) for f in feats_L]
+
+            # Decode
+            latent_poseD_L = wa_L_exp + directions_D_L
+            pred_chunk = gen.dec(latent_poseD_L, feats_L_exp, e_L)  # (chunk, 3, H, W)
+
+        # Write frames
+        for j in range(chunk_size):
+            pred_bgr = tensor_to_bgr(pred_chunk[j], size)
+
+            if cli.side_by_side:
+                if spk_static is not None:
+                    spk_bgr = tensor_to_bgr(spk_static, size)
+                elif cap_spk is not None:
+                    ok, bgr = cap_spk.read()
+                    if ok:
+                        spk_bgr = cv2.resize(bgr, (size, size))
                     else:
-                        alpha_D_lip = torch.zeros(B, gen.lip_dim, device=device)
-                    # GPU process for bank output
-                    f_pose_temp, _ = gru_pose(f_pose)
-                    f_pose = 0.5 * f_pose_temp + 0.5 * f_pose  # skip connection
-                    f_exp_temp, _ = gru_exp(f_exp)
-                    f_exp = 0.5 * f_exp_temp + 0.5 * f_exp  # skip connection
+                        spk_bgr = np.zeros((size, size, 3), dtype=np.uint8)
+                else:
+                    spk_bgr = np.zeros((size, size, 3), dtype=np.uint8)
+                frame = np.concatenate([spk_bgr, pred_bgr], axis=1)
+            else:
+                frame = pred_bgr
 
-                alpha_D_pose = gen.pose_fc(f_pose) * cli.motion_scale
-                alpha_D_exp  = gen.exp_fc(f_exp)   * cli.motion_scale
+            writer.write(frame)
+            frame_count += 1
 
-                alpha_D_L = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
-                a_L = gen.direction_exp.get_shared_out(alpha_D_L, gen.direction_lipnonlip.weight)
-                e_L = gen.direction_exp.get_exp_latent(a_L)
-                directions_D_L = gen.direction_exp(alpha_D_L, gen.direction_lipnonlip.weight)
-                latent_poseD_L = wa_L + directions_D_L
-
-                pred = gen.dec(latent_poseD_L, feats_L, e_L)
-
-                if cli.debug and i == 0:
-                    print(f"  [DEBUG] mode: active, audio={'YES' if frame_mel is not None else 'NO'}")
-                    print(f"  [DEBUG] lip_sync: {'Audio2Lip' if audio2lip is not None else 'zero'}")
-                    print(f"  [DEBUG] alpha_D_pose norm: {alpha_D_pose.norm().item():.4f}")
-                    print(f"  [DEBUG] alpha_D_exp norm:  {alpha_D_exp.norm().item():.4f}")
-                    print(f"  [DEBUG] alpha_D_lip norm:  {alpha_D_lip.norm().item():.4f}")
-
-        if cli.smooth > 0.0 and prev_pred is not None:
-            pred = cli.smooth * prev_pred + (1.0 - cli.smooth) * pred
-        prev_pred = pred.clone()
-
-        pred_bgr = tensor_to_bgr(pred[0], size)
-
-        if cli.side_by_side:
-            spk_bgr = tensor_to_bgr(spk_t[0], size)
-            frame = np.concatenate([spk_bgr, pred_bgr], axis=1)
-        else:
-            frame = pred_bgr
-
-        writer.write(frame)
-
-        if (i + 1) % 30 == 0:
-            print(f"  {i+1}/{n_frames} frames")
+        print(f"  {frame_count}/{n_frames} frames decoded")
 
     if cap_spk:
         cap_spk.release()
     if cap_lis:
         cap_lis.release()
     writer.release()
-    print(f"Saved -> {cli.out}")
+
+    print(f"\nDone! Saved ⊥ {cli.out}")
+    print(f"  T_model={T_MODEL} ⊥ n_frames={n_frames} (interpolation ratio: {n_frames/T_MODEL:.1f}x)")
+    if cli.debug:
+        print(f"  [DEBUG] alpha_pose range: [{alpha_pose_full.min().item():.4f}, {alpha_pose_full.max().item():.4f}]")
+        print(f"  [DEBUG] alpha_exp  range: [{alpha_exp_full.min().item():.4f}, {alpha_exp_full.max().item():.4f}]")
+        print(f"  [DEBUG] alpha_lip  range: [{alpha_lip_full.min().item():.4f}, {alpha_lip_full.max().item():.4f}]")
 
 
 if __name__ == "__main__":

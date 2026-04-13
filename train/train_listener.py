@@ -188,8 +188,8 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=4,
+            persistent_workers=False,
+            prefetch_factor=2,
         )
     else:
         dataloader = DataLoader(
@@ -199,8 +199,8 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=4,
+            persistent_workers=False,
+            prefetch_factor=2,
         )
 
     # ------------------------------------------------------------------ #
@@ -216,7 +216,10 @@ def main(args):
     if args.distributed:
         from torch.nn.parallel import DistributedDataParallel as DDP
         trainer.gen = DDP(trainer.gen, device_ids=[local_rank], find_unused_parameters=True)
-        trainer.dis = DDP(trainer.dis, device_ids=[local_rank], find_unused_parameters=True)
+        # Discriminator is frozen (fixed critic) — do NOT wrap in DDP.
+        # DDP raises RuntimeError when a module has no parameters that
+        # require gradients.  D only performs forward passes for adv_loss,
+        # no gradient sync needed across ranks.
 
     current_iter = args.start_iter
     if args.resume_ckpt is not None:
@@ -358,8 +361,8 @@ if __name__ == "__main__":
                         help="Max frame gap for listener identity frame")
     parser.add_argument("--frames_per_video", type=int, default=1,
                         help="Times each video pair appears per epoch (1 for utterance-level)")
-    parser.add_argument("--max_frames", type=int, default=64,
-                        help="Maximum number of frames to load per video (memory limit)")
+    parser.add_argument("--max_frames", type=int, default=16,
+                        help="Maximum number of frames to load per video (16=4x faster than 64)")
     parser.add_argument("--num_workers", type=int, default=4)
 
     # Model
@@ -393,19 +396,24 @@ if __name__ == "__main__":
     parser.add_argument("--g_reg_every", type=int, default=4)
     parser.add_argument("--d_reg_every", type=int, default=16)
     parser.add_argument("--lambda_vgg", type=float, default=1.0)
-    parser.add_argument("--lambda_l1",  type=float, default=1.0)
-    parser.add_argument("--lambda_adv", type=float, default=0.1)
+    parser.add_argument("--lambda_l1",  type=float, default=0.5)
+    parser.add_argument("--lambda_adv", type=float, default=0.3)
     parser.add_argument("--lambda_kl",  type=float, default=0.01,
                         help="KL loss weight for ReactionVAE (active mode only)")
     parser.add_argument("--lambda_bank", type=float, default=5.0,
                         help="Bank loss weight: L1 between bank-predicted and GT listener coefficients")
-    parser.add_argument("--lambda_motion_amp", type=float, default=2.0,
+    parser.add_argument("--lambda_motion_amp", type=float, default=5.0,
                         help="Motion amplitude loss weight: penalises motion variance < GT variance")
     parser.add_argument("--kl_warmup_iters", type=int, default=5000,
                         help="Iterations to linearly ramp KL weight from 0 to lambda_kl")
     parser.add_argument("--training_mode", type=str, default="active",
                         choices=["passive", "active"],
                         help="'active': VAE-sampled reactions; 'passive': mirroring only")
+    parser.add_argument("--exp_amp_max", type=float, default=1.5,
+                        help="Expression amplification ceiling. GT expressions are randomly "
+                             "amplified by U(1.0, exp_amp_max) and re-rendered via the frozen "
+                             "decoder so image+coefficient targets stay consistent. "
+                             "Set 1.0 to disable (default 1.5).")
 
     # Training schedule
     parser.add_argument("--epoch",      type=int, default=50)

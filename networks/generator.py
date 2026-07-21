@@ -268,7 +268,7 @@ class Generator(nn.Module):
         f_pose_S = self.direction_exp.get_pose_latent(shared_out)  # (B, 512)
         f_exp_S  = self.direction_exp.get_exp_latent(shared_out)   # (B, 512)
         directions_D_S = torch.sum(shared_out, dim=1)              # (B, 512)
-        return wa_S + directions_D_S, wa_S, f_pose_S, f_exp_S
+        return wa_S + directions_D_S, wa_S, f_pose_S, f_exp_S, self.pose_fc(shared), self.exp_fc(shared)
 
     def forward_listener_frame(
         self,
@@ -396,7 +396,7 @@ class Generator(nn.Module):
         #    by merging the time axis into the batch axis.
         # ------------------------------------------------------------------
         spk_flat = img_speaker.view(B * T, C, H, W)
-        latent_poseD_S_flat, wa_S_flat, f_pose_S_flat, f_exp_S_flat = \
+        latent_poseD_S_flat, wa_S_flat, f_pose_S_flat, f_exp_S_flat, alpha_D_pose_S, alpha_D_exp_S = \
             self._speaker_latent(spk_flat)
         # all: (B*T, feat_dim)
 
@@ -423,7 +423,7 @@ class Generator(nn.Module):
              mu_p_flat, logvar_p_flat,
              mu_e_flat, logvar_e_flat) = \
                 self.listener_bank.forward_active(
-                    latent_poseD_S_flat,
+                    latent_poseD_S_flat, f_pose_S_flat, f_exp_S_flat, 
                     wa_S=wa_L_flat,
                     training=training,
                     listener_mel=mel_flat,
@@ -457,6 +457,17 @@ class Generator(nn.Module):
         alpha_D_exp = self.exp_fc(
             f_exp_temporal.reshape(B * T, -1)
         ).view(B, T, -1)   # (B, T, exp_dim)
+        
+        ## for debug, speaker bank feature
+        #alpha_D_pose_S = self.pose_fc(
+        #    f_pose_S_flat.reshape(B * T, -1)
+        #).view(B, T, -1)   # (B, T, pose_dim)
+        alpha_D_pose_S= alpha_D_pose_S.view(B, T, -1)
+
+        #alpha_D_exp_S = self.exp_fc(
+        #    f_exp_S_flat.reshape(B * T, -1)
+        #).view(B, T, -1)   # (B, T, exp_dim)
+        alpha_D_exp_S= alpha_D_exp_S.view(B, T, -1)
 
         # ------------------------------------------------------------------
         # 6. Lip coefficients -- use audio-derived features when available,
@@ -509,9 +520,12 @@ class Generator(nn.Module):
 
         img_recon      = img_recon_flat.view(B, T, C, H, W)
         latent_poseD_S = latent_poseD_S_flat.view(B, T, -1)
+        
+        
 
         return (
             img_recon, f_pose_temporal, f_exp_temporal,
             alpha_D_pose, alpha_D_exp, latent_poseD_S,
             mu_p, logvar_p, mu_e, logvar_e,
+            alpha_D_pose_S, alpha_D_exp_S
         )

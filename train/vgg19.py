@@ -82,11 +82,14 @@ class VGGLoss(nn.Module):
     def __init__(self):
         super(VGGLoss, self).__init__()
 
-        self.scales = [1, 0.5, 0.25, 0.125]
+        # self.scales = [1, 0.5, 0.25, 0.125] # original
+        self.scales = [1, 0.5] # EmpaTalk, for less computation
         self.pyramid = ImagePyramide(self.scales, 3).cuda()
 
         # vgg loss
         self.vgg = Vgg19().cuda()
+        for param in self.vgg.parameters():
+            param.requires_grad = False
         self.weights = (10, 10, 10, 10, 10)
 
     def forward(self, img_recon, img_real):
@@ -98,7 +101,8 @@ class VGGLoss(nn.Module):
         vgg_loss = 0
         for scale in self.scales:
             recon_vgg = self.vgg(pyramid_recon['prediction_' + str(scale)])
-            real_vgg = self.vgg(pyramid_real['prediction_' + str(scale)])
+            with torch.no_grad(): # EmpaTalk, for less computation
+                real_vgg = self.vgg(pyramid_real['prediction_' + str(scale)])
 
             for i, weight in enumerate(self.weights):
                 value = torch.abs(recon_vgg[i] - real_vgg[i].detach()).mean()

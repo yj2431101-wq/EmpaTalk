@@ -149,6 +149,7 @@ def main():
     parser.add_argument("--listener_audio", default=None,
                         help="Listener audio (.wav). Enables pose/exp conditioning "
                              "via mel_proj (same path as training).")
+    parser.add_argument("--listener_pt",    default=None, help="listener correct bank .pt")
     parser.add_argument("--audio2lip_ckpt", default=None,
                         help="Audio2Lip checkpoint (.pt). Drives lip sync at "
                              "original frame rate (independent of T_model).")
@@ -160,7 +161,7 @@ def main():
                         help="save speaker|listener side-by-side")
     parser.add_argument("--motion_scale", type=float, default=1.0,
                         help="motion coefficient scale (>1 amplifies movement)")
-    parser.add_argument("--decode_chunk", type=int, default=32,
+    parser.add_argument("--decode_chunk", type=int, default=48,
                         help="frames per decode batch (reduce if OOM)")
     parser.add_argument("--debug",        action="store_true")
     cli = parser.parse_args()
@@ -272,19 +273,25 @@ def main():
         
     # ── 7.5. tgt listener # for bank_debug ──────────────────────────────────
     # load tgt
-    cap_lis_tgt = cv2.VideoCapture(cli.listener_tgt)
-    lis_tgt_T = read_frames_uniform(cap_lis_tgt, size, n_frames, T_MODEL).to(device)
-    # extract tgt bank
-    wa_tgt, _, _, _ = gen.enc(lis_tgt_T, None)
-    shared_tgt = gen.fc(wa_tgt)
-    alpha_D_pose_tgt = gen.pose_fc(shared_tgt).view(1, T_MODEL, -1)
-    alpha_D_exp_tgt  = gen.exp_fc(shared_tgt).view(1, T_MODEL, -1)
-    # replace pose/exp bank to tgt
-    #alpha_D_pose = alpha_D_pose_tgt
-    #alpha_D_exp = alpha_D_exp_tgt
-    alpha_D_pose = alpha_D_pose / 1.5
-    alpha_D_exp = alpha_D_exp / 1.5
-    
+    # cap_lis_tgt = cv2.VideoCapture(cli.listener_tgt)
+    # lis_tgt_T = read_frames_uniform(cap_lis_tgt, size, n_frames, T_MODEL).to(device)
+    # # extract tgt bank
+    # wa_tgt, _, _, _ = gen.enc(lis_tgt_T, None)
+    # shared_tgt = gen.fc(wa_tgt)
+    # alpha_D_pose_tgt = gen.pose_fc(shared_tgt).view(1, T_MODEL, -1)
+    # alpha_D_exp_tgt  = gen.exp_fc(shared_tgt).view(1, T_MODEL, -1)
+    # # replace pose/exp bank to tgt
+    # alpha_D_pose = alpha_D_pose_tgt
+    # alpha_D_exp = alpha_D_exp_tgt
+
+    # ── 7.5. correct listener # for bank_debug ──────────────────────────────────
+    if cli.listener_pt:
+        data = torch.load(cli.listener_pt, map_location='cpu')
+        l_pose = data["L_pose"].to(device)
+        l_exp = data["L_exp"].to(device)
+        alpha_D_pose = l_pose
+        alpha_D_exp = l_exp
+        print("load correct bank from pt")
 
     print(f"  alpha_D_pose: {alpha_D_pose.shape}, norm={alpha_D_pose.norm().item():.4f}")
     print(f"  alpha_D_exp:  {alpha_D_exp.shape},  norm={alpha_D_exp.norm().item():.4f}")

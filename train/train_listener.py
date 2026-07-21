@@ -43,6 +43,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import utils
 from tqdm import tqdm
+from pathlib import Path
 
 from datasets.dataset_avamerg import AvaMERGDataset
 from train.trainer_listener import TrainerListener
@@ -188,19 +189,19 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=False,
-            prefetch_factor=2,
+            persistent_workers=True, #False,
+            prefetch_factor=4 #2,
         )
     else:
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=False, #True,
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=False,
-            prefetch_factor=2,
+            persistent_workers=True, #False,
+            prefetch_factor=4 #2,
         )
 
     # ------------------------------------------------------------------ #
@@ -232,8 +233,15 @@ def main(args):
     print("==> training")
     last_sample_path = None
 
-    epoch_bar = tqdm(range(args.epoch), desc="Epoch", unit="epoch",
-                     position=0, dynamic_ncols=True, file=sys.stderr)
+    epoch_bar = tqdm(
+        range(args.epoch),
+        desc="Epoch",
+        unit="epoch",
+        position=0,
+        leave=True,  # Epoch 바는 지워지지 않게 고정
+        file=sys.stdout,  # stderr 대신 stdout 권장 (버퍼 꼬임 방지)
+        disable=True
+    )
 
     for epoch in epoch_bar:
         if args.distributed:
@@ -241,12 +249,12 @@ def main(args):
 
         batch_bar = tqdm(
             dataloader,
-            desc=f"  Train",
+            desc="  Train",
             unit="batch",
-            position=1,
             leave=False,
-            dynamic_ncols=True,
-            file=sys.stderr,
+            dynamic_ncols=True,  # 고정 ncols 대신 유동적으로 설정
+            file=sys.stdout,
+            mininterval=10.0  # 5.0은 너무 기니 1.0 정도로 조정
         )
 
         for batch in batch_bar:
@@ -256,6 +264,7 @@ def main(args):
             img_src  = batch["listener_source"].to(device)   # (B, C, H, W)
             img_tgt  = batch["listener_target"].to(device)   # (B, T, C, H, W)
             mel_tgt  = batch["listener_mel"].to(device)      # (B, T, N_MELS)
+            dia_num = Path(batch['dia_num'][0]).stem # ex)dia08645utt0_28
 
             # KL warmup: linearly ramp from 0 -> lambda_kl over kl_warmup_iters
             if args.training_mode == 'active' and args.lambda_kl > 0:
@@ -269,6 +278,7 @@ def main(args):
                     img_spk, img_src, img_tgt,
                     kl_weight=kl_weight,
                     mel_listener_tgt=mel_tgt,
+                    dia_num=dia_num
                 )
 
             # Discriminator step
@@ -276,13 +286,13 @@ def main(args):
 
             # ---- progress bar live loss display ----
             batch_bar.set_postfix(
-                vgg=f"{vgg_loss.item():.3f}",
-                l1=f"{l1_loss.item():.3f}",
-                adv=f"{adv_loss.item():.3f}",
-                kl=f"{kl_loss.item():.3f}",
-                bank=f"{bank_loss.item():.3f}",
-                amp=f"{motion_amp_loss.item():.3f}",
-                d=f"{d_loss.item():.3f}",
+                vgg=f"{vgg_loss.item():.1f}",
+                l1=f"{l1_loss.item():.1f}",
+                # adv=f"{adv_loss.item():.1f}",
+                # kl=f"{kl_loss.item():.1f}",
+                bank=f"{bank_loss.item():.1f}",
+                amp=f"{motion_amp_loss.item():.1f}",
+                # d=f"{d_loss.item():.1f}",
             )
 
             # ---- loss history & live plot (rank 0 only, every iter) ----
@@ -334,6 +344,10 @@ def main(args):
                         last_sample_path,
                         os.path.join(ckpt_path, f"step_{current_iter:06d}.jpg"),
                     )
+            if is_main and current_iter == 2000:
+                print('strop training')
+                break
+
 
         epoch_bar.set_postfix(iter=current_iter)
 
@@ -416,7 +430,7 @@ if __name__ == "__main__":
                              "Set 1.0 to disable (default 1.5).")
 
     # Training schedule
-    parser.add_argument("--epoch",      type=int, default=50)
+    parser.add_argument("--epoch",      type=int, default=1) # 50
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--start_iter", type=int, default=0)
 
@@ -425,10 +439,10 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name",       type=str, default="v1")
     parser.add_argument("--log_iter",       type=int, default=10)
     parser.add_argument("--display_freq",   type=int, default=50)
-    parser.add_argument("--plot_freq",      type=int, default=50,
+    parser.add_argument("--plot_freq",      type=int, default=1000,
                         help="Save loss_curve.png every N iterations (matplotlib is slow)")
     parser.add_argument("--image_save_iter",type=int, default=500)
-    parser.add_argument("--save_freq",      type=int, default=2000)
+    parser.add_argument("--save_freq",      type=int, default=200000)
 
     # DDP
     parser.add_argument("--distributed",  action="store_true")

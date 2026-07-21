@@ -215,6 +215,8 @@ class ListenerBank(nn.Module):
     def forward_active(
         self,
         latent_poseD_S: torch.Tensor,
+        f_pose_S: torch.Tensor,
+        f_exp_S: torch.Tensor,
         wa_S: torch.Tensor = None,
         training: bool = True,
         listener_mel: torch.Tensor = None,
@@ -239,11 +241,11 @@ class ListenerBank(nn.Module):
 
         if listener_mel is not None:
             mel_feat = self.mel_proj(listener_mel.float())  # (B, D)
-            f_pose_L, _ = self._attend_audio(self.pose_q, self.pose_k, self.pose_v, mel_feat, latent_poseD_S)
-            f_exp_L,  _ = self._attend_audio(self.exp_q,  self.exp_k,  self.exp_v,  mel_feat, latent_poseD_S)
+            f_pose_L, _ = self._attend_audio(self.pose_q, self.pose_k, self.pose_v, mel_feat, f_pose_S)
+            f_exp_L,  _ = self._attend_audio(self.exp_q,  self.exp_k,  self.exp_v,  mel_feat, f_exp_S)
         else:
-            f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, latent_poseD_S)
-            f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  latent_poseD_S)
+            f_pose_L, _ = self._attend(self.pose_q, self.pose_k, self.pose_v, self.pose_bank, f_pose_S)
+            f_exp_L,  _ = self._attend(self.exp_q,  self.exp_k,  self.exp_v,  self.exp_bank,  f_exp_S)
 
         f_pose, mu_p, logvar_p = self.pose_vae(
             vae_ctx, f_pose_L, deterministic=not training

@@ -410,4 +410,5 @@ class AvaMERGDataset(Dataset):
             "speaker_mel":     speaker_mel,        # (T, N_MELS)
             "listener_mel":    listener_mel,       # (T, N_MELS)
             "pair_id": f"{pair['spk_id']}#{pair['lis_id']}@{identity_idx}",
+            "dia_num": f"{pair['lis_path']}"
         }

@@ -123,8 +123,7 @@ class TrainerListener(nn.Module):
         self.lambda_vgg        = getattr(args, "lambda_vgg",        1.0)
         self.lambda_l1         = getattr(args, "lambda_l1",         0.5)  # reduced: less mean-face regression
         self.lambda_adv        = getattr(args, "lambda_adv",        0.3)  # increased: push for realistic motion
-        self.lambda_bank       = getattr(args, "lambda_bank",       5.0)
-        self.lambda_bank_tgt   = getattr(args, "lambda_bank_tgt",   2.0)  # increased: encourage larger coefficients
+        self.lambda_bank       = getattr(args, "lambda_bank",       6.0)
         self.lambda_motion_amp = getattr(args, "lambda_motion_amp", 5.0)  # increased: penalise static faces
 
         # Expression amplification: re-render GT with amplified expressions
@@ -135,6 +134,9 @@ class TrainerListener(nn.Module):
         bank_init = getattr(args, "bank_init", None)
         if bank_init is not None and os.path.isfile(bank_init):
             self.gen.listener_bank.init_from_prototypes(bank_init)
+
+        # Mixed Precision
+        self.scaler = torch.amp.GradScaler('cuda')
 
         self.start_iter = 0
 
@@ -262,7 +264,7 @@ class TrainerListener(nn.Module):
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def _amplify_expression_targets(
+    def _amplify_pose_exp_targets(
         self,
         img_tgt_flat: torch.Tensor,
         amp_scale: float,
@@ -290,8 +292,8 @@ class TrainerListener(nn.Module):
         shared = gen.fc(wa)
 
         alpha_lip  = gen.lip_fc(shared)
-        alpha_pose = gen.pose_fc(shared)
-        alpha_exp  = gen.exp_fc(shared) * amp_scale   # amplify expression only
+        alpha_pose = gen.pose_fc(shared) * amp_scale
+        alpha_exp  = gen.exp_fc(shared) * amp_scale
 
         alpha_D = torch.cat([alpha_lip, alpha_pose, alpha_exp], dim=-1)
         a = gen.direction_exp.get_shared_out(alpha_D, gen.direction_lipnonlip.weight)
@@ -312,6 +314,7 @@ class TrainerListener(nn.Module):
             img_listener_tgt: torch.Tensor,  # (B, T, C, H, W)
             kl_weight: float = 0.0,
             mel_listener_tgt: torch.Tensor = None,  # (B, T, audio_dim)
+            dia_num = None,
     ):
         """One generator step over a full utterance sequence.
 
@@ -334,74 +337,88 @@ class TrainerListener(nn.Module):
 
         B, T, C, H, W = img_listener_tgt.shape
 
-        # Forward -- all outputs carry the T dimension.
-        img_recon, f_pose, f_exp, alpha_D_pose, alpha_D_exp, _, \
-            mu_p, logvar_p, mu_e, logvar_e = \
-            self._raw_gen.forward_listener(
-                img_speaker, img_listener_src,
-                mode=self.training_mode,
-                training=True,
-                listener_mel=mel_listener_tgt,
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            # Forward -- all outputs carry the T dimension.
+            img_recon, f_pose, f_exp, alpha_D_pose, alpha_D_exp, _, \
+                mu_p, logvar_p, mu_e, logvar_e, alpha_D_pose_S, alpha_D_exp_S = \
+                self._raw_gen.forward_listener(
+                    img_speaker, img_listener_src,
+                    mode=self.training_mode,
+                    training=True,
+                    listener_mel=mel_listener_tgt,
+                )
+
+            # GT bank coefficients + optional expression amplification.
+            # When exp_amp_max > 1.0, GT frames are re-rendered with amplified
+            # expressions so that image losses and coefficient losses are aligned.
+            with torch.no_grad():
+                tgt_flat = img_listener_tgt.view(B * T, C, H, W)
+
+                if self.exp_amp_max > 1.0:
+                    amp = 1.0 + torch.rand(1).item() * (self.exp_amp_max - 1.0)
+                    img_tgt_flat, alpha_pose_flat, alpha_exp_flat = \
+                        self._amplify_pose_exp_targets(tgt_flat, amp)
+                    alpha_D_pose_tgt = alpha_pose_flat.view(B, T, -1)
+                    alpha_D_exp_tgt  = alpha_exp_flat.view(B, T, -1)
+                else:
+                    wa_tgt, _, _, _ = self._raw_gen.enc(tgt_flat, None)
+                    shared_tgt = self._raw_gen.fc(wa_tgt)
+                    alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt).view(B, T, -1)
+                    alpha_D_exp_tgt  = self._raw_gen.exp_fc(shared_tgt).view(B, T, -1)
+                    img_tgt_flat = tgt_flat
+
+            # Image losses -- flatten T into batch.
+            img_recon_flat = img_recon.view(B * T, C, H, W)
+
+            adv_pred = self.dis(img_recon_flat)
+            vgg_loss = self.criterion_vgg(img_recon_flat, img_tgt_flat).mean()
+            l1_loss = F.l1_loss(img_recon_flat, img_tgt_flat)
+            adv_loss = F.softplus(-adv_pred).mean()
+
+            # Bank loss
+            bank_loss = (self._bank_sequence_loss(alpha_D_pose, alpha_D_pose_tgt)
+                         + self._bank_sequence_loss(alpha_D_exp, alpha_D_exp_tgt)
+                        ) * self.lambda_bank
+
+            # KL loss -- pose + exp VAEs only (active mode).
+            kl_loss = torch.zeros(1, device=self.device)
+            if mu_p is not None and kl_weight > 0.0:
+                kl_loss = (
+                    self._kl_loss(mu_p, logvar_p)
+                    + self._kl_loss(mu_e, logvar_e)
+                ) * kl_weight
+
+            # Motion amplitude loss
+            motion_amp_loss = torch.zeros(1, device=self.device)
+            if self.lambda_motion_amp > 0.0:
+                motion_amp_loss = (
+                    self._motion_amplitude_loss(alpha_D_pose, alpha_D_pose_tgt)
+                    + self._motion_amplitude_loss(alpha_D_exp, alpha_D_exp_tgt)
+                ) * self.lambda_motion_amp
+
+            g_loss = (
+                    self.lambda_vgg * vgg_loss
+                    + self.lambda_l1 * l1_loss
+                    + self.lambda_adv * adv_loss
+                    + kl_loss
+                    + bank_loss
+                    + motion_amp_loss
             )
 
-        # GT bank coefficients + optional expression amplification.
-        # When exp_amp_max > 1.0, GT frames are re-rendered with amplified
-        # expressions so that image losses and coefficient losses are aligned.
-        with torch.no_grad():
-            tgt_flat = img_listener_tgt.view(B * T, C, H, W)
-
-            if self.exp_amp_max > 1.0:
-                amp = 1.0 + torch.rand(1).item() * (self.exp_amp_max - 1.0)
-                img_tgt_flat, alpha_pose_flat, alpha_exp_flat = \
-                    self._amplify_expression_targets(tgt_flat, amp)
-                alpha_D_pose_tgt = alpha_pose_flat.view(B, T, -1)
-                alpha_D_exp_tgt  = alpha_exp_flat.view(B, T, -1)
-            else:
-                wa_tgt, _, _, _ = self._raw_gen.enc(tgt_flat, None)
-                shared_tgt = self._raw_gen.fc(wa_tgt)
-                alpha_D_pose_tgt = self._raw_gen.pose_fc(shared_tgt).view(B, T, -1)
-                alpha_D_exp_tgt  = self._raw_gen.exp_fc(shared_tgt).view(B, T, -1)
-                img_tgt_flat = tgt_flat
-
-        # Image losses -- flatten T into batch.
-        img_recon_flat = img_recon.view(B * T, C, H, W)
-
-        adv_pred = self.dis(img_recon_flat)
-        vgg_loss = self.criterion_vgg(img_recon_flat, img_tgt_flat).mean()
-        l1_loss = F.l1_loss(img_recon_flat, img_tgt_flat)
-        adv_loss = F.softplus(-adv_pred).mean()
-
-        # Bank loss
-        bank_loss = (self._bank_sequence_loss(alpha_D_pose, alpha_D_pose_tgt*self.lambda_bank_tgt)
-                     + self._bank_sequence_loss(alpha_D_exp, alpha_D_exp_tgt*self.lambda_bank_tgt)
-                    ) * self.lambda_bank
-
-        # KL loss -- pose + exp VAEs only (active mode).
-        kl_loss = torch.zeros(1, device=self.device)
-        if mu_p is not None and kl_weight > 0.0:
-            kl_loss = (
-                self._kl_loss(mu_p, logvar_p)
-                + self._kl_loss(mu_e, logvar_e)
-            ) * kl_weight
-
-        # Motion amplitude loss
-        motion_amp_loss = torch.zeros(1, device=self.device)
-        if self.lambda_motion_amp > 0.0:
-            motion_amp_loss = (
-                self._motion_amplitude_loss(alpha_D_pose, alpha_D_pose_tgt)
-                + self._motion_amplitude_loss(alpha_D_exp, alpha_D_exp_tgt)
-            ) * self.lambda_motion_amp
-
-        g_loss = (
-                self.lambda_vgg * vgg_loss
-                + self.lambda_l1 * l1_loss
-                + self.lambda_adv * adv_loss
-                + kl_loss
-                + bank_loss
-                + motion_amp_loss
-        )
-        g_loss.backward()
-        self.g_optim.step()
+        g_loss.backward() # w/o mixed precision
+        self.g_optim.step() # w/o mixed precision
+        
+        print('[DEBUG] bank feature')
+        save_path = f"/home/yjcho/EmpaTalk/bank_debug/train-code-dia-238000pt/bank_{dia_num}.pt"
+        torch.save({
+            "S_pose": alpha_D_pose_S.detach().cpu(),
+            "S_exp": alpha_D_exp_S.detach().cpu(),
+            "L_pose": alpha_D_pose.detach().cpu(),
+            "L_exp": alpha_D_exp.detach().cpu(),
+            "L_tgt_pose": alpha_D_pose_tgt.detach().cpu(),
+            "L_tgt_exp": alpha_D_exp_tgt.detach().cpu(),
+        }, save_path)
+        print("saved at: ", save_path)
 
         return vgg_loss, l1_loss, adv_loss, kl_loss, bank_loss, motion_amp_loss, img_recon.detach()
 
@@ -491,7 +508,7 @@ class TrainerListener(nn.Module):
         if img_speaker.dim() == 5:
             img_speaker = img_speaker[:, 0]  # (B, C, H, W)
 
-        latent_poseD_S, wa_S, f_pose_S, f_exp_S = gen._speaker_latent(img_speaker)
+        latent_poseD_S, wa_S, f_pose_S, f_exp_S, _, _= gen._speaker_latent(img_speaker)
         wa_L, _, feats_L, _ = gen.enc(img_listener_src, None, None)
         B, device = latent_poseD_S.size(0), latent_poseD_S.device
 
@@ -558,14 +575,22 @@ class TrainerListener(nn.Module):
             print(f"  Audio modules not in ckpt (randomly init'd): {len(audio_missing)} keys")
         if unexpected:
             print(f"  [WARNING] Unexpected keys in ckpt: {unexpected}")
+        else:
+            print(f"  listener bank loaded")
 
         self._raw_dis.load_state_dict(ckpt["dis"])
 
         # Load temporal GRU states (critical for empathy temporal modelling)
         if "temp_gru_pose" in ckpt:
-            self._raw_gen.temporal_gru_pose.load_state_dict(ckpt["temp_gru_pose"])
-            self._raw_gen.temporal_gru_exp.load_state_dict(ckpt["temp_gru_exp"])
-            print("  Temporal GRU states loaded")
+            missing, unexpected = self._raw_gen.temporal_gru_pose.load_state_dict(ckpt["temp_gru_pose"])
+            if missing: print("  [WARNING] Missing keys in ckpt: {missing}")
+            elif unexpected: print(f"  [WARNING] Unexpected missing keys: {other_missing}")
+            else: print("  Temporal GRU pose states loaded")
+            missing, unexpected = self._raw_gen.temporal_gru_exp.load_state_dict(ckpt["temp_gru_exp"])
+            if missing: print("  [WARNING] Missing keys in ckpt: {missing}")
+            elif unexpected: print(f"  [WARNING] Unexpected missing keys: {other_missing}")
+            else: print("  Temporal GRU exp states loaded")
+            
         else:
             print("  [WARN] No GRU states in checkpoint (randomly init'd)")
 
